@@ -21,6 +21,13 @@
 //! `--with-config` restores it in place, and a data dir with no config gets
 //! the archived one as before.
 //!
+//! The wiki's own `.git` is code-bearing too: git runs hooks, and a config can
+//! name a command for `git status` (`core.fsmonitor`) or point at other hooks.
+//! A restore extracts only git's data from it (objects, refs, logs, HEAD, the
+//! index) and installs a freshly generated config; every other file there, any
+//! nested repository and any `.git` that is not a directory are left out and
+//! named in the output.
+//!
 //! # Exception to invariant §16
 //!
 //! `restore` is one of the documented exceptions to the rule that the CLI
@@ -73,6 +80,65 @@ enum ConfigPlacement {
     Divert,
 }
 
+/// Lock a directory a restore creates down to owner-only (`0700`).
+///
+/// A backup holds the SQLite database (API-key hashes, session and
+/// observation text) and `config.toml` (the token pepper and provider
+/// credentials). The archive is extracted with `set_preserve_permissions`
+/// off, so without this every restored file lands at the process umask —
+/// world- or group-readable on a shared host. These helpers restrict the
+/// roots a restore *creates*; an existing data dir is left as the operator
+/// set it, since it may be shared on purpose. A no-op off Unix, where the
+/// mode bits do not apply.
+#[cfg(unix)]
+fn restrict_dir_to_owner(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+/// Lock a file a restore creates down to owner-only (`0600`). See
+/// [`restrict_dir_to_owner`].
+#[cfg(unix)]
+fn restrict_file_to_owner(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn restrict_dir_to_owner(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_file_to_owner(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Lock the staged `wiki/` and `db/` roots and the two secret-bearing files
+/// (the SQLite database and `config.toml`) down to the owner before they are
+/// renamed into a data dir that may be shared. The directory modes alone bar
+/// a non-owner from traversing in; the file modes are defence in depth.
+fn restrict_staged_tree(staging: &Path) -> Result<()> {
+    for dir in REPLACED_DIRS {
+        let staged = staging.join(dir);
+        if staged.is_dir() {
+            restrict_dir_to_owner(&staged)
+                .with_context(|| format!("restricting permissions on {}", staged.display()))?;
+        }
+    }
+    let staged_db = staging.join("db").join("memory.sqlite");
+    if staged_db.is_file() {
+        restrict_file_to_owner(&staged_db)
+            .with_context(|| format!("restricting permissions on {}", staged_db.display()))?;
+    }
+    let staged_config = staging.join(CONFIG_FILE);
+    if staged_config.is_file() {
+        restrict_file_to_owner(&staged_config)
+            .with_context(|| format!("restricting permissions on {}", staged_config.display()))?;
+    }
+    Ok(())
+}
+
 /// Run the `restore` subcommand.
 ///
 /// # Errors
@@ -81,16 +147,24 @@ enum ConfigPlacement {
 /// extracted, or the restored store fails to open. In every one of those
 /// cases the live data dir is left as it was.
 pub async fn run(config: &Config, args: RestoreArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let siblings = sibling_processes();
     if !siblings.is_empty() {
         bail!(busy_message("restore", &siblings));
     }
 
     if !args.from.is_file() {
-        bail!("source tarball {} not found", args.from.display());
+        bail!(
+            "{}",
+            i18n.format(
+                "cli-restore-source-tarball-not-found",
+                &[("value0", format!("{}", args.from.display()))]
+            )
+        );
     }
 
     let outcome = restore_data_dir_with_legacy_pepper(
+        &config.i18n,
         &config.data_dir,
         &args.from,
         args.force,
@@ -101,19 +175,20 @@ pub async fn run(config: &Config, args: RestoreArgs) -> Result<()> {
     .await?;
     info!("restore complete");
     println!(
-        "restored {} -> {}",
-        args.from.display(),
-        config.data_dir.display()
+        "{}",
+        i18n.format(
+            "cli-restore-restored",
+            &[
+                ("value0", format!("{}", args.from.display())),
+                ("value1", format!("{}", config.data_dir.display()))
+            ]
+        )
     );
     match outcome {
         ConfigOutcome::NotInArchive => {}
-        ConfigOutcome::Restored => println!("restored the backup's config.toml"),
+        ConfigOutcome::Restored => println!("{}", i18n.text("cli-restore-restored-the-backup-s-config-toml")),
         ConfigOutcome::SavedBeside(path) => println!(
-            "kept the live config.toml; the backup's copy is at {}. A config can run \
-             commands and redirect data: review it before adopting it, or rerun with \
-             --with-config to restore it in place.",
-            path.display()
-        ),
+            "{}", i18n.format("cli-restore-kept-the-live-config-toml-the-backup-s-copy-is-at-a-config-can-run-commands", &[("value0", format!("{}", path.display()))])),
     }
     Ok(())
 }
@@ -125,15 +200,17 @@ pub async fn run(config: &Config, args: RestoreArgs) -> Result<()> {
 /// rename and rolled back if any step of the exchange fails.
 #[cfg(test)]
 async fn restore_data_dir(
+    i18n: &ai_memory_core::i18n::Localizer,
     data_dir: &Path,
     from: &Path,
     force: bool,
     with_config: bool,
 ) -> Result<ConfigOutcome> {
-    restore_data_dir_with_legacy_pepper(data_dir, from, force, with_config, None, false).await
+    restore_data_dir_with_legacy_pepper(i18n, data_dir, from, force, with_config, None, false).await
 }
 
 async fn restore_data_dir_with_legacy_pepper(
+    i18n: &ai_memory_core::i18n::Localizer,
     data_dir: &Path,
     from: &Path,
     force: bool,
@@ -150,7 +227,14 @@ async fn restore_data_dir_with_legacy_pepper(
             data_dir.display(),
         );
     }
+    let data_dir_existed = data_dir.exists();
     std::fs::create_dir_all(data_dir)?;
+    if !data_dir_existed {
+        // We created the restore root, so it is ours to lock down. An
+        // existing data dir is left untouched — it may be shared on purpose.
+        restrict_dir_to_owner(data_dir)
+            .with_context(|| format!("restricting permissions on {}", data_dir.display()))?;
+    }
 
     // Both scratch directories live inside the data dir so every move below
     // is a rename on one filesystem, never a copy that could half-complete.
@@ -163,6 +247,7 @@ async fn restore_data_dir_with_legacy_pepper(
     let previous = data_dir.join(format!(".restore-previous-{stamp}"));
 
     let outcome = stage_then_swap(
+        i18n,
         data_dir,
         from,
         &staging,
@@ -179,14 +264,22 @@ async fn restore_data_dir_with_legacy_pepper(
     {
         warn!(path = %staging.display(), error = %e, "could not remove restore staging dir");
         eprintln!(
-            "warning: could not remove staging dir {} ({e}); delete it by hand",
-            staging.display()
+            "{}",
+            crate::localization::diagnostic(
+                i18n,
+                format!(
+                    "warning: could not remove staging dir {} ({e}); delete it by hand",
+                    staging.display()
+                )
+            )
         );
     }
     outcome
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stage_then_swap(
+    i18n: &ai_memory_core::i18n::Localizer,
     data_dir: &Path,
     from: &Path,
     staging: &Path,
@@ -197,6 +290,10 @@ async fn stage_then_swap(
 ) -> Result<ConfigOutcome> {
     std::fs::create_dir(staging)
         .with_context(|| format!("creating staging dir {}", staging.display()))?;
+    // The staging dir briefly holds the archive's SQLite database and config
+    // before they are swapped live; lock it to the owner before extraction.
+    restrict_dir_to_owner(staging)
+        .with_context(|| format!("restricting permissions on {}", staging.display()))?;
 
     // 1. Extract into staging, validating every entry on the way. A
     //    truncated gzip stream, an unreadable member or a path outside the
@@ -204,8 +301,35 @@ async fn stage_then_swap(
     let file = std::fs::File::open(from).with_context(|| format!("opening {}", from.display()))?;
     let decoder = GzDecoder::new(file);
     let mut archive = tar::Archive::new(decoder);
-    unpack_checked_archive(&mut archive, staging)
+    let left_out = unpack_checked_archive(&mut archive, staging)
         .with_context(|| format!("extracting {} into {}", from.display(), staging.display()))?;
+    if !left_out.is_empty() {
+        let names: Vec<String> = left_out
+            .iter()
+            .take(5)
+            .map(|path| path.display().to_string())
+            .collect();
+        let more = left_out.len().saturating_sub(names.len());
+        let listed = if more == 0 {
+            names.join(", ")
+        } else {
+            format!("{} and {more} more", names.join(", "))
+        };
+        warn!(
+            count = left_out.len(),
+            "restore left out wiki git files git could run"
+        );
+        eprintln!(
+            "{}",
+            crate::localization::diagnostic(
+                i18n,
+                format!(
+                    "ai-memory: left out {} file(s) from the backup's wiki git directory that git could run or follow ({listed}); the wiki's git config was rebuilt",
+                    left_out.len()
+                )
+            )
+        );
+    }
     // tar stops at its zero header, before the gzip decoder necessarily reads
     // the checksum/size trailer. Finish the member before trusting its files.
     // https://docs.rs/tar/latest/tar/struct.Archive.html#method.set_ignore_zeros
@@ -220,6 +344,15 @@ async fn stage_then_swap(
     } else {
         ConfigPlacement::Divert
     };
+
+    if placement == ConfigPlacement::Install {
+        let source = std::fs::read_to_string(staging.join(CONFIG_FILE))
+            .context(i18n.text("cli-restore-reading-backup-config"))?;
+        // Parser errors can include the input line and its credentials.
+        source
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|_| anyhow::anyhow!(i18n.text("cli-restore-backup-config-invalid-toml")))?;
+    }
 
     // 2. Open + drop the staged store so refinery applies any pending
     //    migrations and the SQLite file is validated — still before anything
@@ -256,11 +389,30 @@ async fn stage_then_swap(
             bail!("the restored API-key pepper verifier could not be bound");
         }
     }
-    // Keeping the live config must not leave a server that refuses to start:
-    // its loaded pepper must match the restored API keys.
-    if placement != ConfigPlacement::Install && has_api_credentials {
+    // The restore must not leave a server that refuses to start: the pepper
+    // the next `serve` loads must match the restored API keys. That is the
+    // live one, unless the backup's config.toml is being installed, in which
+    // case it is whatever that config (plus the environment) supplies (#2172).
+    if has_api_credentials {
+        let installed_pepper = if placement == ConfigPlacement::Install {
+            Config::load_with_runtime_env(
+                Some(&staging.join(CONFIG_FILE)),
+                Some(data_dir.to_path_buf()),
+                crate::config::RuntimeEnv::from_process(),
+            )
+            .context("loading the backup's config.toml (the live data was not changed)")?
+            .auth
+            .token_pepper
+        } else {
+            None
+        };
+        let effective_pepper = if placement == ConfigPlacement::Install {
+            installed_pepper.as_deref()
+        } else {
+            token_pepper
+        };
         let matches = match (
-            token_pepper.filter(|value| !value.trim().is_empty()),
+            effective_pepper.filter(|value| !value.trim().is_empty()),
             store.reader.api_credential_pepper_verifier().await?,
         ) {
             (Some(pepper), Some(verifier)) => {
@@ -271,6 +423,14 @@ async fn stage_then_swap(
             _ => false,
         };
         if !matches {
+            if placement == ConfigPlacement::Install {
+                bail!(
+                    "the backup's config.toml does not supply the [auth].token_pepper its API \
+                     keys were hashed with, so the restored server would refuse to start; set \
+                     the original pepper (AI_MEMORY_AUTH__TOKEN_PEPPER, or token_pepper in that \
+                     config) before retrying (the live data was not changed)"
+                );
+            }
             if placement == ConfigPlacement::Absent {
                 bail!(
                     "the backup does not contain config.toml and the configured \
@@ -289,28 +449,20 @@ async fn stage_then_swap(
     }
     drop(store);
 
+    // Extraction dropped the archive's permission bits, so the restored tree
+    // sits at the process umask. Lock its roots and secret files down before
+    // they move into a data dir that may be shared.
+    restrict_staged_tree(staging)?;
+
     // 3. Exchange the live directories for the staged ones.
-    swap_into_place(
-        data_dir,
-        staging,
-        previous,
-        placement == ConfigPlacement::Install,
-    )?;
+    swap_into_place(i18n, data_dir, staging, previous, placement)?;
     info!(into = %data_dir.display(), "restored data swapped into place");
 
     Ok(match placement {
         ConfigPlacement::Absent => ConfigOutcome::NotInArchive,
         ConfigPlacement::Install => ConfigOutcome::Restored,
         ConfigPlacement::Divert => {
-            let beside = data_dir.join(CONFIG_FROM_BACKUP_FILE);
-            save_archived_config(&staging.join(CONFIG_FILE), &beside).with_context(|| {
-                format!(
-                    "the restore completed and kept the live config.toml, but saving the \
-                     backup's config.toml to {} failed",
-                    beside.display()
-                )
-            })?;
-            ConfigOutcome::SavedBeside(beside)
+            ConfigOutcome::SavedBeside(data_dir.join(CONFIG_FROM_BACKUP_FILE))
         }
     })
 }
@@ -318,11 +470,7 @@ async fn stage_then_swap(
 /// Move the staged config beside the live one, owner-only: it can hold the
 /// API-key pepper and other credentials.
 fn save_archived_config(staged: &Path, beside: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(staged, std::fs::Permissions::from_mode(0o600))?;
-    }
+    restrict_file_to_owner(staged)?;
     std::fs::rename(staged, beside)
 }
 
@@ -331,12 +479,17 @@ fn save_archived_config(staged: &Path, beside: &Path) -> std::io::Result<()> {
 /// rename; if one fails, the moves already made are reversed so the data
 /// dir ends up as it started.
 fn swap_into_place(
+    i18n: &ai_memory_core::i18n::Localizer,
     data_dir: &Path,
     staging: &Path,
     previous: &Path,
-    install_config: bool,
+    placement: ConfigPlacement,
 ) -> Result<()> {
     std::fs::create_dir(previous).with_context(|| format!("creating {}", previous.display()))?;
+    // `previous` holds the live wiki/ and db/ while the swap runs; keep it
+    // owner-only so the old database is not briefly exposed on a shared host.
+    restrict_dir_to_owner(previous)
+        .with_context(|| format!("restricting permissions on {}", previous.display()))?;
 
     // Entries moved from the data dir into `previous`, and staged entries
     // already placed live: the two lists a rollback has to undo.
@@ -344,7 +497,8 @@ fn swap_into_place(
     let mut placed: Vec<&str> = Vec::new();
 
     let exchange = (|| -> Result<()> {
-        for name in REPLACED_DIRS {
+        let config = (placement == ConfigPlacement::Install).then_some(&CONFIG_FILE);
+        for name in REPLACED_DIRS.iter().chain(config) {
             let live = data_dir.join(name);
             if live.exists() {
                 std::fs::rename(&live, previous.join(name))
@@ -352,13 +506,6 @@ fn swap_into_place(
                 moved_aside.push(name);
             }
         }
-        let live_config = data_dir.join(CONFIG_FILE);
-        if install_config && live_config.exists() {
-            std::fs::rename(&live_config, previous.join(CONFIG_FILE))
-                .with_context(|| format!("moving {} aside", live_config.display()))?;
-            moved_aside.push(CONFIG_FILE);
-        }
-        let config = install_config.then_some(&CONFIG_FILE);
         for name in REPLACED_DIRS.iter().chain(config) {
             let staged = staging.join(name);
             if staged.exists() {
@@ -366,6 +513,13 @@ fn swap_into_place(
                     .with_context(|| format!("moving {} into place", staged.display()))?;
                 placed.push(name);
             }
+        }
+        if placement == ConfigPlacement::Divert {
+            // Keep the previous data until the sidecar rename succeeds. This
+            // must be the last fallible step because it replaces any old copy.
+            let beside = data_dir.join(CONFIG_FROM_BACKUP_FILE);
+            save_archived_config(&staging.join(CONFIG_FILE), &beside)
+                .with_context(|| format!("moving {} into place", beside.display()))?;
         }
         Ok(())
     })();
@@ -380,6 +534,9 @@ fn swap_into_place(
                 data_dir.display(),
             );
         }
+        if let Err(cleanup_error) = std::fs::remove_dir(previous) {
+            warn!(path = %previous.display(), error = %cleanup_error, "could not remove empty restore rollback dir");
+        }
         return Err(e.context("restore swap failed; the previous data was moved back into place"));
     }
 
@@ -388,9 +545,15 @@ fn swap_into_place(
     if let Err(e) = std::fs::remove_dir_all(previous) {
         warn!(path = %previous.display(), error = %e, "could not remove pre-restore data");
         eprintln!(
-            "warning: restore succeeded but the pre-restore data under {} could not be \
+            "{}",
+            crate::localization::diagnostic(
+                i18n,
+                format!(
+                    "warning: restore succeeded but the pre-restore data under {} could not be \
              removed ({e}); delete it by hand",
-            previous.display()
+                    previous.display()
+                )
+            )
         );
     }
     Ok(())
@@ -427,21 +590,97 @@ fn remove_path(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Extract every allowed entry into `data_dir` and return the wiki git files
+/// left out ([`wiki_git_entry_kept`]). When the archive carried the wiki's
+/// `.git`, its config is replaced by a freshly generated one.
 fn unpack_checked_archive<R: std::io::Read>(
     archive: &mut tar::Archive<R>,
     data_dir: &Path,
-) -> Result<()> {
+) -> Result<Vec<PathBuf>> {
     archive.set_preserve_permissions(false);
+    let mut left_out = Vec::new();
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
         let entry_type = entry.header().entry_type();
         validate_restore_entry(&path, entry_type)?;
+        if !wiki_git_entry_kept(&path, entry_type) {
+            left_out.push(path);
+            continue;
+        }
         entry
             .unpack_in(data_dir)
             .with_context(|| format!("extracting {}", path.display()))?;
     }
-    Ok(())
+    let git_dir = data_dir.join("wiki").join(".git");
+    if git_dir.is_dir() {
+        let config = ai_memory_wiki::fresh_repository_config()
+            .context("generating a git config for the restored wiki")?;
+        std::fs::write(git_dir.join("config"), config)
+            .with_context(|| format!("writing {}", git_dir.join("config").display()))?;
+    }
+    Ok(left_out)
+}
+
+/// Whether `component` names a git directory as git itself would resolve it:
+/// case-insensitively, with the trailing dots and spaces Windows ignores, and
+/// as the 8.3 short name `GIT~1`.
+fn is_git_dir_name(component: &std::ffi::OsStr) -> bool {
+    let name = component.to_string_lossy().to_ascii_lowercase();
+    let name = name.trim_end_matches(['.', ' ']);
+    name == ".git" || name == "git~1"
+}
+
+/// Files under the wiki repository's `.git` that hold only git's data, which
+/// git reads but never runs: everything else there (hooks, the config,
+/// `config.worktree`, `commondir`, `worktrees/`, `modules/`, `info/attributes`,
+/// alternates) is left out of a restore.
+fn is_git_data_file(inner: &str) -> bool {
+    const FILES: &[&str] = &[
+        "HEAD",
+        "ORIG_HEAD",
+        "FETCH_HEAD",
+        "COMMIT_EDITMSG",
+        "description",
+        "index",
+        "packed-refs",
+        "info/exclude",
+        "info/refs",
+    ];
+    if FILES.contains(&inner) || inner.starts_with("refs/") || inner.starts_with("logs/") {
+        return true;
+    }
+    inner.starts_with("objects/")
+        && !matches!(
+            inner,
+            "objects/info/alternates" | "objects/info/http-alternates"
+        )
+}
+
+/// Whether a restore extracts this (already validated) entry. Outside the
+/// wiki's `.git` every allowed path is kept, except anything under a nested
+/// git directory. Inside it, directories are kept and files only when they
+/// are git's data ([`is_git_data_file`]). A `.git` that is a file (a gitlink
+/// naming another directory) is left out.
+fn wiki_git_entry_kept(path: &Path, entry_type: tar::EntryType) -> bool {
+    let parts: Vec<&std::ffi::OsStr> = path.components().map(Component::as_os_str).collect();
+    let Some(git_at) = parts.iter().position(|part| is_git_dir_name(part)) else {
+        return true;
+    };
+    if git_at != 1 || parts.first().is_none_or(|first| *first != "wiki") {
+        return false;
+    }
+    if entry_type.is_dir() {
+        return true;
+    }
+    if parts.len() == 2 {
+        return false;
+    }
+    let inner: Vec<String> = parts[2..]
+        .iter()
+        .map(|part| part.to_string_lossy().into_owned())
+        .collect();
+    parts[1] == ".git" && is_git_data_file(&inner.join("/"))
 }
 
 /// The backup writes `db/memory.sqlite` via `tar::Builder`'s default sparse
@@ -645,7 +884,10 @@ mod tests {
 
         let archive_dir = tempfile::TempDir::new().unwrap();
         let archive_path = archive_dir.path().join("backup.tar.gz");
+        // Distributions may default to pax (`--format=posix`), which encodes
+        // sparse files without the GNU-sparse entry type this test needs.
         let status = std::process::Command::new("tar")
+            .arg("--format=gnu")
             .arg("--sparse")
             .arg("-czf")
             .arg(&archive_path)
@@ -862,9 +1104,15 @@ mod tests {
         let scratch = tempfile::TempDir::new().unwrap();
         let from = write_tarball(scratch.path(), "bad.tar.gz", b"this is not a gzip stream");
 
-        let err = restore_data_dir(data.path(), &from, true, false)
-            .await
-            .unwrap_err();
+        let err = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             format!("{err:#}").contains("extracting"),
@@ -881,9 +1129,15 @@ mod tests {
         let whole = good_archive();
         let from = write_tarball(scratch.path(), "cut.tar.gz", &whole[..whole.len() / 2]);
 
-        let err = restore_data_dir(data.path(), &from, true, false)
-            .await
-            .unwrap_err();
+        let err = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             format!("{err:#}").contains("extracting"),
@@ -903,9 +1157,15 @@ mod tests {
         bytes[checksum_offset] ^= 0x80;
         let from = write_tarball(scratch.path(), "bad-crc.tar.gz", &bytes);
 
-        let err = restore_data_dir(data.path(), &from, true, false)
-            .await
-            .unwrap_err();
+        let err = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             format!("{err:#}").contains("verifying gzip stream"),
@@ -928,9 +1188,15 @@ mod tests {
             &bytes[..bytes.len() - 8],
         );
 
-        let err = restore_data_dir(data.path(), &from, true, false)
-            .await
-            .unwrap_err();
+        let err = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             format!("{err:#}").contains("verifying gzip stream"),
@@ -957,9 +1223,15 @@ mod tests {
             ]),
         );
 
-        let err = restore_data_dir(data.path(), &from, true, false)
-            .await
-            .unwrap_err();
+        let err = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             format!("{err:#}").contains("unexpected path"),
@@ -982,9 +1254,15 @@ mod tests {
             ]),
         );
 
-        let err = restore_data_dir(data.path(), &from, true, false)
-            .await
-            .unwrap_err();
+        let err = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             format!("{err:#}").contains("opening restored store"),
@@ -1004,9 +1282,15 @@ mod tests {
             &gz_tarball(&[("wiki/default/project/notes/new.md", b"new page")]),
         );
 
-        let error = restore_data_dir(data.path(), &from, true, false)
-            .await
-            .unwrap_err();
+        let error = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
         assert!(format!("{error:#}").contains("initialized ai-memory database snapshot"));
         assert_live_data_untouched(data.path());
     }
@@ -1025,9 +1309,15 @@ mod tests {
             ]),
         );
 
-        let error = restore_data_dir(data.path(), &from, true, false)
-            .await
-            .unwrap_err();
+        let error = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
         assert!(format!("{error:#}").contains("initialized ai-memory database snapshot"));
         assert_live_data_untouched(data.path());
     }
@@ -1052,9 +1342,15 @@ mod tests {
             &gz_tarball(&[("db/memory.sqlite", &db)]),
         );
 
-        let error = restore_data_dir(data.path(), &from, true, false)
-            .await
-            .unwrap_err();
+        let error = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
         assert!(format!("{error:#}").contains("initialized ai-memory database snapshot"));
         assert_live_data_untouched(data.path());
     }
@@ -1071,9 +1367,15 @@ mod tests {
             &gz_tarball(&[("db/memory.sqlite", &db)]),
         );
 
-        restore_data_dir(data.path(), &from, true, false)
-            .await
-            .unwrap();
+        restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
 
         let conn = rusqlite::Connection::open(data.path().join("db/memory.sqlite")).unwrap();
         let pages: i64 = conn
@@ -1095,9 +1397,15 @@ mod tests {
         let scratch = tempfile::TempDir::new().unwrap();
         let from = write_tarball(scratch.path(), "good.tar.gz", &good_archive());
 
-        let err = restore_data_dir(data.path(), &from, false, false)
-            .await
-            .unwrap_err();
+        let err = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             err.to_string().contains("pass --force"),
@@ -1113,9 +1421,15 @@ mod tests {
         let scratch = tempfile::TempDir::new().unwrap();
         let from = write_tarball(scratch.path(), "good.tar.gz", &good_archive());
 
-        let outcome = restore_data_dir(data.path(), &from, true, true)
-            .await
-            .unwrap();
+        let outcome = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            true,
+            true,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome, ConfigOutcome::Restored);
         assert!(!data.path().join(CONFIG_FROM_BACKUP_FILE).exists());
 
@@ -1151,12 +1465,64 @@ mod tests {
         drop(Store::open(data.path()).unwrap());
     }
 
+    #[tokio::test]
+    async fn restore_refuses_invalid_toml_only_when_installing_the_archived_config() {
+        let data = tempfile::TempDir::new().unwrap();
+        seed_live_data(data.path());
+        let scratch = tempfile::TempDir::new().unwrap();
+        let db = migrated_sqlite_bytes();
+        let archived = b"llm_headers = [\"archive-config-canary\"\n";
+        let from = write_tarball(
+            scratch.path(),
+            "invalid-config.tar.gz",
+            &gz_tarball(&[
+                ("wiki/default/project/notes/new.md", b"new page"),
+                ("db/memory.sqlite", db.as_slice()),
+                ("config.toml", archived),
+            ]),
+        );
+        let i18n = ai_memory_core::i18n::Localizer::default();
+        let fresh = scratch.path().join("fresh");
+        for (target, force, with_config) in
+            [(data.path(), true, true), (fresh.as_path(), false, false)]
+        {
+            let error = restore_data_dir(&i18n, target, &from, force, with_config)
+                .await
+                .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("the backup's config.toml is not valid TOML"));
+            assert!(!message.contains("archive-config-canary"));
+        }
+        assert_live_data_untouched(data.path());
+        assert!(!fresh.join("wiki").exists());
+        assert!(!fresh.join("db").exists());
+        assert!(!fresh.join(CONFIG_FILE).exists());
+        assert!(restore_scratch_dirs(&fresh).is_empty());
+
+        let outcome = restore_data_dir(&i18n, data.path(), &from, true, false)
+            .await
+            .unwrap();
+        let beside = data.path().join(CONFIG_FROM_BACKUP_FILE);
+        assert_eq!(outcome, ConfigOutcome::SavedBeside(beside.clone()));
+        assert_eq!(std::fs::read(beside).unwrap(), archived);
+        assert_eq!(
+            std::fs::read(data.path().join(CONFIG_FILE)).unwrap(),
+            b"# old config\n"
+        );
+        assert_eq!(
+            std::fs::read(data.path().join("wiki/default/project/notes/new.md")).unwrap(),
+            b"new page"
+        );
+    }
+
     /// A backup's config can run commands, so by default the live one stays
     /// and the archived one is saved beside it, owner-only, for review.
     #[tokio::test]
     async fn restore_keeps_a_live_config_and_saves_the_archived_one_beside_it() {
         let data = tempfile::TempDir::new().unwrap();
         seed_live_data(data.path());
+        let beside = data.path().join(CONFIG_FROM_BACKUP_FILE);
+        std::fs::write(&beside, b"# previous archived config\n").unwrap();
         let scratch = tempfile::TempDir::new().unwrap();
         let archived = b"[auto_improve.eval]\nenabled = true\ncommand = [\"/bin/false\"]\n";
         let db = migrated_sqlite_bytes();
@@ -1170,11 +1536,16 @@ mod tests {
             ]),
         );
 
-        let outcome = restore_data_dir(data.path(), &from, true, false)
-            .await
-            .unwrap();
+        let outcome = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
 
-        let beside = data.path().join(CONFIG_FROM_BACKUP_FILE);
         assert_eq!(outcome, ConfigOutcome::SavedBeside(beside.clone()));
         assert_eq!(
             std::fs::read(data.path().join("config.toml")).unwrap(),
@@ -1197,6 +1568,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_keeps_live_data_when_the_archived_config_cannot_be_saved() {
+        let data = tempfile::TempDir::new().unwrap();
+        seed_live_data(data.path());
+        let beside = data.path().join(CONFIG_FROM_BACKUP_FILE);
+        std::fs::create_dir(&beside).unwrap();
+        let marker = beside.join("keep.txt");
+        std::fs::write(&marker, b"operator file").unwrap();
+        let scratch = tempfile::TempDir::new().unwrap();
+        let from = write_tarball(scratch.path(), "backup.tar.gz", &good_archive());
+
+        let error = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains(CONFIG_FROM_BACKUP_FILE));
+        assert_live_data_untouched(data.path());
+        assert_eq!(std::fs::read(marker).unwrap(), b"operator file");
+    }
+
+    #[tokio::test]
     async fn restore_keeps_the_live_config_when_the_archive_carries_none() {
         let data = tempfile::TempDir::new().unwrap();
         seed_live_data(data.path());
@@ -1211,9 +1608,15 @@ mod tests {
             ]),
         );
 
-        let outcome = restore_data_dir(data.path(), &from, true, true)
-            .await
-            .unwrap();
+        let outcome = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            true,
+            true,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome, ConfigOutcome::NotInArchive);
         assert!(!data.path().join(CONFIG_FROM_BACKUP_FILE).exists());
@@ -1228,15 +1631,232 @@ mod tests {
         assert!(restore_scratch_dirs(data.path()).is_empty());
     }
 
+    /// Every path a restore keeps or leaves out under the wiki's git
+    /// directory, including the spellings a case-insensitive or Windows
+    /// filesystem resolves to `.git`.
+    #[test]
+    fn only_git_data_survives_from_the_wiki_git_directory() {
+        let file = tar::EntryType::file();
+        let dir = tar::EntryType::dir();
+        for path in [
+            "wiki/default/project/notes/x.md",
+            "wiki/.gitattributes",
+            "wiki/.git/HEAD",
+            "wiki/.git/index",
+            "wiki/.git/packed-refs",
+            "wiki/.git/description",
+            "wiki/.git/info/exclude",
+            "wiki/.git/objects/ab/cdef0123",
+            "wiki/.git/objects/pack/pack-1.pack",
+            "wiki/.git/refs/heads/main",
+            "wiki/.git/logs/HEAD",
+        ] {
+            assert!(
+                wiki_git_entry_kept(Path::new(path), file),
+                "{path} was left out"
+            );
+        }
+        for path in ["wiki/.git", "wiki/.git/hooks", "wiki/.git/objects"] {
+            assert!(
+                wiki_git_entry_kept(Path::new(path), dir),
+                "dir {path} was left out"
+            );
+        }
+        for path in [
+            "wiki/.git/config",
+            "wiki/.git/hooks/post-commit",
+            "wiki/.git/hooks/pre-commit.sample",
+            "wiki/.git/config.worktree",
+            "wiki/.git/commondir",
+            "wiki/.git/worktrees/w/config.worktree",
+            "wiki/.git/modules/sub/config",
+            "wiki/.git/modules/sub/hooks/post-checkout",
+            "wiki/.git/info/attributes",
+            "wiki/.git/objects/info/alternates",
+            "wiki/.git/objects/info/http-alternates",
+            "wiki/.git/ai-memory.gitconfig",
+            "wiki/.git/fsmonitor.sh",
+            "wiki/.git",
+            "wiki/sub/.git",
+            "wiki/sub/.git/config",
+            "wiki/sub/.git/hooks/post-commit",
+            "wiki/.GIT/hooks/post-commit",
+            "wiki/.Git/config",
+            "wiki/.git./hooks/post-commit",
+            "wiki/.git /config",
+            "wiki/GIT~1/hooks/post-commit",
+            "wiki/.GIT/HEAD",
+        ] {
+            assert!(
+                !wiki_git_entry_kept(Path::new(path), file),
+                "{path} was kept"
+            );
+        }
+        assert!(!wiki_git_entry_kept(Path::new("wiki/sub/.git"), dir));
+    }
+
+    #[cfg(unix)]
+    fn git(dir: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .expect("git runs")
+    }
+
+    /// Adversarial (GHSA-w734-2f7h-6qcp): a genuine backup with an executable
+    /// `post-commit` hook and a `core.fsmonitor` command added to the wiki's
+    /// `.git`. After the restore neither runs, on a read-only `git status` or
+    /// a `git commit`, while the wiki's history still reads back (control).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restore_never_brings_back_wiki_git_hooks_or_config() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: git is not installed");
+            return;
+        }
+        let work = tempfile::TempDir::new().unwrap();
+        let markers = work.path().join("markers");
+        std::fs::create_dir(&markers).unwrap();
+        let repo = work.path().join("repo");
+        std::fs::create_dir_all(repo.join("default/project/notes")).unwrap();
+        std::fs::write(repo.join("default/project/notes/new.md"), b"new page").unwrap();
+        assert!(git(&repo, &["init", "-q"]).status.success());
+        assert!(git(&repo, &["add", "-A"]).status.success());
+        let committed = git(
+            &repo,
+            &[
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-q",
+                "--no-gpg-sign",
+                "-m",
+                "page",
+            ],
+        );
+        assert!(committed.status.success(), "{committed:?}");
+        // The two planted payloads: a hook git runs on commit and a monitor
+        // command git runs on a read-only status.
+        let hook = repo.join(".git/hooks/post-commit");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\ntouch '{}'\n", markers.join("hook").display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let monitor = markers.join("fsmonitor.sh");
+        std::fs::write(
+            &monitor,
+            format!(
+                "#!/bin/sh\ntouch '{}'\n",
+                markers.join("fsmonitor").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&monitor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = std::fs::read_to_string(repo.join(".git/config")).unwrap();
+        config.push_str(&format!("[core]\n\tfsmonitor = {}\n", monitor.display()));
+        std::fs::write(repo.join(".git/config"), config).unwrap();
+        // The poisoned repository really runs both before any restore.
+        assert!(git(&repo, &["status", "--porcelain"]).status.success());
+        assert!(
+            markers.join("fsmonitor").exists(),
+            "the fixture monitor must fire"
+        );
+        std::fs::remove_file(markers.join("fsmonitor")).unwrap();
+
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            builder.append_dir_all("wiki", &repo).unwrap();
+            let db = migrated_sqlite_bytes();
+            let mut header = tar::Header::new_gnu();
+            header.set_path("db/memory.sqlite").unwrap();
+            header.set_size(db.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, db.as_slice()).unwrap();
+            builder.finish().unwrap();
+        }
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut gz, &tar_bytes).unwrap();
+        let from = write_tarball(work.path(), "poisoned.tar.gz", &gz.finish().unwrap());
+
+        let data = tempfile::TempDir::new().unwrap();
+        restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let wiki = data.path().join("wiki");
+        assert!(!wiki.join(".git/hooks/post-commit").exists());
+        let restored_config = std::fs::read_to_string(wiki.join(".git/config")).unwrap();
+        assert!(!restored_config.contains("fsmonitor"), "{restored_config}");
+
+        assert!(git(&wiki, &["status", "--porcelain"]).status.success());
+        let commit = git(
+            &wiki,
+            &[
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-q",
+                "--no-gpg-sign",
+                "--allow-empty",
+                "-m",
+                "after restore",
+            ],
+        );
+        assert!(commit.status.success(), "{commit:?}");
+        assert!(
+            !markers.join("fsmonitor").exists(),
+            "the restored monitor ran"
+        );
+        assert!(!markers.join("hook").exists(), "the restored hook ran");
+        // Control: the restored history is intact.
+        let log = git(&wiki, &["log", "--format=%s"]);
+        assert_eq!(
+            String::from_utf8_lossy(&log.stdout),
+            "after restore\npage\n"
+        );
+        assert_eq!(
+            std::fs::read(wiki.join("default/project/notes/new.md")).unwrap(),
+            b"new page"
+        );
+    }
+
     #[tokio::test]
     async fn restore_into_an_empty_data_dir_needs_no_force() {
         let data = tempfile::TempDir::new().unwrap();
         let scratch = tempfile::TempDir::new().unwrap();
         let from = write_tarball(scratch.path(), "good.tar.gz", &good_archive());
 
-        let outcome = restore_data_dir(data.path(), &from, false, false)
-            .await
-            .unwrap();
+        let outcome = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             std::fs::read(data.path().join("wiki/default/project/notes/new.md")).unwrap(),
@@ -1253,6 +1873,84 @@ mod tests {
         assert!(restore_scratch_dirs(data.path()).is_empty());
     }
 
+    /// GHSA-mhmf: a restore must not leave the backup's SQLite database or
+    /// `config.toml` — which carry API-key hashes, the token pepper and
+    /// provider credentials — group- or world-readable. Extraction drops the
+    /// archive's permission bits, so under a normal umask every restored file
+    /// would land at `0755`/`0644`; the restore instead locks its own roots
+    /// and the two secret files down to the owner. Bites: with the
+    /// `restrict_*` calls removed the restored modes carry the umask's
+    /// group/other bits and the `& 0o077` assertions fail.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restore_locks_restored_secrets_to_the_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let owner_only = |p: &Path| {
+            assert_eq!(
+                mode(p) & 0o077,
+                0,
+                "{} is group/world accessible: {:o}",
+                p.display(),
+                mode(p)
+            );
+        };
+
+        // A data dir the restore creates itself: the root and every
+        // secret-bearing path it restores must be owner-only.
+        let data = tempfile::TempDir::new().unwrap();
+        let root = data.path().join("store");
+        let scratch = tempfile::TempDir::new().unwrap();
+        let from = write_tarball(scratch.path(), "good.tar.gz", &good_archive());
+
+        restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            &root,
+            &from,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        owner_only(&root);
+        owner_only(&root.join("db"));
+        owner_only(&root.join("db/memory.sqlite"));
+        owner_only(&root.join("wiki"));
+        owner_only(&root.join("config.toml"));
+        // Control: the tightening does not break the owner's own access.
+        drop(Store::open(&root).unwrap());
+
+        // An existing, possibly shared, data dir: the replaced roots and the
+        // installed config are locked, but the operator's own data dir root
+        // is left exactly as they set it.
+        let shared = tempfile::TempDir::new().unwrap();
+        seed_live_data(shared.path());
+        std::fs::set_permissions(shared.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
+        let from2 = write_tarball(scratch.path(), "good2.tar.gz", &good_archive());
+
+        restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            shared.path(),
+            &from2,
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+
+        owner_only(&shared.path().join("db"));
+        owner_only(&shared.path().join("db/memory.sqlite"));
+        owner_only(&shared.path().join("wiki"));
+        owner_only(&shared.path().join("config.toml"));
+        assert_eq!(
+            mode(shared.path()),
+            0o750,
+            "an existing data dir root must not be re-permissioned"
+        );
+    }
+
     #[tokio::test]
     async fn legacy_api_key_restore_requires_original_pepper_confirmation() {
         let data = tempfile::TempDir::new().unwrap();
@@ -1266,6 +1964,7 @@ mod tests {
         );
 
         let refused = restore_data_dir_with_legacy_pepper(
+            &ai_memory_core::i18n::Localizer::default(),
             data.path(),
             &from,
             true,
@@ -1284,6 +1983,7 @@ mod tests {
         assert_live_data_untouched(data.path());
 
         restore_data_dir_with_legacy_pepper(
+            &ai_memory_core::i18n::Localizer::default(),
             data.path(),
             &from,
             true,
@@ -1326,6 +2026,7 @@ mod tests {
                 let data = tempfile::TempDir::new().unwrap();
                 seed_live_data(data.path());
                 let err = restore_data_dir_with_legacy_pepper(
+                    &ai_memory_core::i18n::Localizer::default(),
                     data.path(),
                     &from,
                     true,
@@ -1346,6 +2047,7 @@ mod tests {
             let data = tempfile::TempDir::new().unwrap();
             seed_live_data(data.path());
             let outcome = restore_data_dir_with_legacy_pepper(
+                &ai_memory_core::i18n::Localizer::default(),
                 data.path(),
                 &from,
                 true,
@@ -1368,6 +2070,48 @@ mod tests {
             assert!(restore_scratch_dirs(data.path()).is_empty());
             let restored = Store::open(data.path()).unwrap();
             assert!(restored.reader.api_credentials_exist().await.unwrap());
+        }
+    }
+
+    /// #2172: installing the backup's `config.toml` must not swap in API keys
+    /// that the next `serve` cannot verify. The pepper that matters is the one
+    /// the installed config will supply, not the live one it replaces, and a
+    /// refusal must not send the operator back to `--with-config`.
+    #[tokio::test]
+    async fn installing_an_archived_config_without_the_pepper_is_refused_before_swap() {
+        let scratch = tempfile::TempDir::new().unwrap();
+        let db = api_key_sqlite_bytes(Some("archive-pepper")).await;
+        let from = write_tarball(
+            scratch.path(),
+            "keys-config-without-pepper.tar.gz",
+            &gz_tarball(&[
+                ("wiki/default/project/notes/new.md", b"new page"),
+                ("db/memory.sqlite", db.as_slice()),
+                ("config.toml", b"# no token_pepper here\n"),
+            ]),
+        );
+
+        // Even the right live pepper does not help: it lives in the config
+        // that `--with-config` replaces.
+        for live_pepper in [Some("archive-pepper"), Some("other-pepper"), None] {
+            let data = tempfile::TempDir::new().unwrap();
+            seed_live_data(data.path());
+            let err = restore_data_dir_with_legacy_pepper(
+                &ai_memory_core::i18n::Localizer::default(),
+                data.path(),
+                &from,
+                true,
+                true,
+                live_pepper,
+                false,
+            )
+            .await
+            .unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains("[auth].token_pepper"), "{err:#}");
+            assert!(!message.contains("rerun with --with-config"), "{err:#}");
+            assert_live_data_untouched(data.path());
+            assert!(restore_scratch_dirs(data.path()).is_empty());
         }
     }
 
@@ -1394,6 +2138,7 @@ mod tests {
             let data = tempfile::TempDir::new().unwrap();
             seed_live_data(data.path());
             let refused = restore_data_dir_with_legacy_pepper(
+                &ai_memory_core::i18n::Localizer::default(),
                 data.path(),
                 &from,
                 true,
@@ -1414,6 +2159,7 @@ mod tests {
         let data = tempfile::TempDir::new().unwrap();
         seed_live_data(data.path());
         let outcome = restore_data_dir_with_legacy_pepper(
+            &ai_memory_core::i18n::Localizer::default(),
             data.path(),
             &from,
             true,
@@ -1432,6 +2178,7 @@ mod tests {
         let data = tempfile::TempDir::new().unwrap();
         seed_live_data(data.path());
         let outcome = restore_data_dir_with_legacy_pepper(
+            &ai_memory_core::i18n::Localizer::default(),
             data.path(),
             &from,
             true,

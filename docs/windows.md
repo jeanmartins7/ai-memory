@@ -245,11 +245,37 @@ ai-memory setup
 missing or mismatched checksum and any archive entry that is absolute or holds
 `..`, unpacks the release to `%LOCALAPPDATA%\Programs\ai-memory` and adds that
 directory to your user `PATH` (set `AI_MEMORY_NO_MODIFY_PATH=1` to skip that).
+The destination must not exist, even as an empty directory or a link. Remove
+it if it is empty or left over from a failed install, or use
+`ai-memory upgrade` for an existing installation. Failed copy/publication
+attempts leave the destination alone and report their staging directory for
+inspection; see the [native installer details](install.md#one-step-native-install-installsh--ai-memory-setup).
 `ai-memory setup` then initialises the data dir (`%LOCALAPPDATA%\ai-memory`),
 registers the server to start at logon (see
 [Scenario E](#scenario-e-keep-the-server-running-native-windows-service)),
 wires the agents it finds, and checks the result. Inside WSL2 the Linux
 `install.sh` and `setup` path works unchanged.
+
+### With Scoop
+
+Releases from 3.4.0 on are also published to the maintainer's
+[Scoop](https://scoop.sh) bucket:
+
+```powershell
+scoop bucket add akitaonrails https://github.com/akitaonrails/scoop-bucket
+scoop install ai-memory
+ai-memory setup
+```
+
+Scoop checks the zip against the release's published SHA-256, unpacks it to
+`<scoop>\apps\ai-memory\<version>` and points the
+`<scoop>\apps\ai-memory\current` junction at it. The `ai-memory` shim on
+`PATH` runs the binary through `current`. `ai-memory setup` records that
+`current` path in the logon entry, the hook commands and the MCP entries,
+never the version directory, so they keep working after
+`scoop update ai-memory` installs the next version and `scoop cleanup` deletes
+the old one. Update with `scoop update ai-memory`: `ai-memory upgrade` refuses
+a Scoop install, because the bucket owns the version.
 
 To do the same by hand:
 
@@ -283,7 +309,8 @@ $EnvKey.Dispose()
     --server-url "https://memory.example.com" --auth-token "<token>"
 ```
 
-Later updates for this install use the same command as Linux/macOS release
+Later updates for this install (not a Scoop one, which updates with
+`scoop update ai-memory`) use the same command as Linux/macOS release
 binaries. From a writable prefix (for example `%LOCALAPPDATA%\ai-memory`),
 run:
 
@@ -500,6 +527,43 @@ Remove-ItemProperty -Path HKCU:\Software\Microsoft\Windows\CurrentVersion\Run -N
 `setup --no-service` skips writing the entry but does not remove one that
 already exists. Without the entry, run `ai-memory serve --transport http`
 in a terminal or use the WinSW service below.
+
+#### Security suites that rewrite AI-tool traffic
+
+Some consumer security suites intercept the network traffic of programs they
+classify as AI tools, and of the processes those tools start. This covers
+plain `http://` traffic too, not only HTTPS. A product that re-frames the
+server's response on the way back hands the client a malformed body, and the
+bridge and hooks fail while the server itself is healthy. This was seen with
+the Safe AI feature of Norton 360 Deluxe 26.10, on processes started by
+Antigravity talking to an `http://` server URL. Avast and AVG come from the
+same vendor and may behave the same way.
+
+Only the applications the product recognizes are affected. On the machine
+above, Safe AI listed Claude, Claude Code, Google Antigravity IDE and Visual
+Studio Code; DeepSeek Harness and Hermes Agent were not on the list, and
+their bridge and hooks to the same server kept working. The list grows with
+product updates, so an agent that works today can start failing after one.
+One agent failing while another on the same machine works points at this
+cause rather than at the server.
+
+**Symptoms.** `ai-memory mcp-bridge` or `ai-memory hook` fails with an HTTP
+decoding error such as `Invalid chunk size line: missing size digit`. The
+response arrives with `Transfer-Encoding: chunked` in place of
+`Content-Length`, but the body is not chunk-encoded. The same request from a
+terminal you opened yourself succeeds. MCP tools and hook capture stop
+together, and only for the agent the product protects.
+
+**How to tell.** Look for the agent in the product's list of protected AI
+tools (in Norton: Safe AI, the tab listing your AI tools). If the error goes away after you turn the
+feature off and restart the agent, the product was the cause.
+
+**What to do.** Turn the feature off (in Norton, switch off Safe AI), then
+restart the agent so the bridge reconnects. This is a different problem from
+the untrusted interception root in
+[HTTPS via a reverse proxy](https-via-proxy.md#outbound-llm-calls-fail-behind-a-tls-inspecting-firewall):
+it happens on plain HTTP as well, and installing the product's root
+certificate does not fix it.
 
 ### A real Windows service
 

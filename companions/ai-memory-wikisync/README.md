@@ -117,16 +117,20 @@ This section describes `plan` and `export`; `sync` adds the rules under
 
 - **API-only.** Documented read-only `/api/v1` endpoints (incremental
   `recent` listing with cursor paging, single-page reads with
-  `ETag`/`If-None-Match` revalidation; the legacy array listing is
-  accepted as a fallback). No admin routes, and `plan` and `export` never
-  write to the server. `401`/`403`/`404` become clear errors; page count
+  `ETag`/`If-None-Match` revalidation; when a legacy server returns a limited
+  `recent` array, the full `pages` listing is fetched instead). No admin routes,
+  and `plan` and `export` never write to the server. `401`/`403`/`404` become
+  clear errors; page count
   and body size are bounded per run.
 - **Path safety.** Every server-reported path is validated into a
   portable shape (ASCII, no traversal, no dotfiles, no reserved Windows
   names, `.md` leaf, bounded depth/length) before it is joined onto
   `--dest`; case-fold collisions are refused; symlinked destinations,
   symlinked components and symlinked state directories are refused; files
-  are replaced atomically (tmp + rename + fsync).
+  are replaced atomically through an unpredictably named, exclusively
+  created staging file (tmp + rename + fsync), so a symlink planted in a
+  shared destination can be neither followed nor raced
+  (GHSA-jr85-7366-xrm2).
   On Windows, ordinary absolute and relative destinations are accepted;
   directory junctions and paths through them are still refused.
 - **Local edits win until forced.** Each page is compared three ways:
@@ -201,7 +205,9 @@ Safety rules:
 - **Deletes are opt-in.** Without `--propagate-deletes` a delete is only
   reported, and the page keeps its state entry so the next run reports it
   again. With it, a side is deleted only if it is unchanged since the last
-  sync; a delete against an edit is a conflict like any other. Pages gone
+  sync; a delete against an edit is a conflict like any other. When both
+  server version IDs are available, a newer version conflicts with a
+  repository delete even if only unexported metadata changed. Pages gone
   from both sides drop out of the state.
 - **Delete safety.** More than `--max-deletes` deletes (default 10) refuses
   the whole run. A pinned server page is never deleted unless `--prefer repo`
@@ -260,8 +266,9 @@ ai-memory-wikisync uninstall-hook --dest docs/wiki [--hooks-dir DIR]
   manager.
 - No token is ever written (`--token` is refused; the hook reads
   `AI_MEMORY_AUTH_TOKEN` when it runs), every argument is single-quoted, and
-  newlines or NUL are refused. The file is replaced atomically with mode
-  0755; a symlinked hook is refused, and an existing hook without the block
+  newlines or NUL are refused. The file is replaced atomically, with mode
+  0755, through an unpredictably named, exclusively created staging file;
+  a symlinked hook is refused, and an existing hook without the block
   is refused unless `--append` is given and its shebang is a POSIX shell.
   The companion never runs git.
 

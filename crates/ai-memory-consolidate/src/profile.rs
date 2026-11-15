@@ -77,8 +77,6 @@ const CLASSIFY_BATCH: usize = 20;
 const MAX_CLASSIFY_CALLS: usize = 8;
 /// Most merge calls one pass makes; the rest use the zero-LLM statement.
 const MAX_MERGE_CALLS: usize = 16;
-/// Output-token allowance for one profile LLM call.
-const PROFILE_LLM_MAX_TOKENS: u32 = 2_000;
 
 const CLASSIFY_SYSTEM_PROMPT: &str = include_str!("../prompts/profile_classify_system.md");
 const MERGE_SYSTEM_PROMPT: &str = include_str!("../prompts/profile_merge_system.md");
@@ -630,11 +628,12 @@ pub struct DetectedPreference {
 /// existed.
 pub(crate) fn user_written(body: &str) -> Option<String> {
     if ai_memory_core::looks_like_markup_block(body)
+        || ai_memory_core::looks_like_machine_turn(body)
         || ai_memory_core::looks_like_codex_instructions(body)
         || ai_memory_core::looks_like_codex_generated_prompt(body)
         || looks_like_codex_assessor_transcript_line(body)
-        || looks_like_claude_cross_session_message(body)
         || looks_like_claude_plugin_prompt(body)
+        || looks_like_desktop_side_session_brief(body)
     {
         return None;
     }
@@ -675,16 +674,6 @@ fn looks_like_codex_assessor_transcript_line(body: &str) -> bool {
             || rest.starts_with("tool exec result:"))
 }
 
-/// Claude Code presents local cross-session traffic as a synthetic user turn.
-/// Match this one tag by name: widening `looks_like_markup_block` to every tag
-/// with attributes would also discard real `<pasted_content ...>` prompts.
-fn looks_like_claude_cross_session_message(body: &str) -> bool {
-    body.trim_start()
-        .strip_prefix("<cross-session-message")
-        .and_then(|rest| rest.chars().next())
-        .is_some_and(|next| next == '>' || next.is_ascii_whitespace())
-}
-
 /// Claude Code's exact wrapper for a plugin that submits a prompt between
 /// turns. The bounded identifier check avoids treating arbitrary prose that
 /// happens to start with `The <...>` as generated context.
@@ -705,6 +694,18 @@ fn looks_like_claude_plugin_prompt(body: &str) -> bool {
             .is_some_and(|tail| {
                 tail.is_empty() || tail.starts_with('\n') || tail.starts_with("\r\n")
             })
+}
+
+/// The Claude desktop app lets one session start another with an
+/// agent-written brief, then appends a fixed footer pointing at the group's
+/// shared `side-session-notes/` folder. The whole first prompt is the lead
+/// agent's words plus that footer, never the user's, so none of it is a habit
+/// — and the footer carries a local filesystem path that must not reach
+/// evidence quotes (#2041). Both halves of the fixed footer must be present so
+/// an ordinary prompt that merely mentions a notes folder is kept.
+fn looks_like_desktop_side_session_brief(body: &str) -> bool {
+    body.contains("Shared notes folder for this group of sessions")
+        && body.contains("side-session-notes/")
 }
 
 /// Remove Claude Code's leading side-agent note while retaining the user's
@@ -1081,27 +1082,65 @@ pub fn applies_to_for(statement: &str) -> Vec<String> {
 }
 
 /// A path-safe slug of at most 60 characters.
+///
+/// Folds like the rule slugger: NFD-decompose, drop the combining marks,
+/// lower-case, keep ASCII letters and digits, collapse the rest to `-`.
+/// When the fold drops a letter or digit (a statement in another script,
+/// or a non-decomposable Latin-1 letter), `-<8 hex>` of the statement's
+/// digest key is appended, so two statements that keep the same ASCII
+/// words but say different things do not converge onto one page, and a
+/// statement with no ASCII at all names itself by digest instead of every
+/// one landing on `entry` (#1943). Pure-ASCII statements keep their exact
+/// old slug.
 #[must_use]
 pub fn slugify(text: &str) -> String {
+    let decomposed = icu_normalizer::DecomposingNormalizer::new_nfd().normalize(text);
+    // The scan runs over the whole statement first: stopping at the fold
+    // cap would miss a dropped letter after it, and two statements that
+    // agree inside the window but differ past it must still part ways.
+    let dropped_alnum = decomposed
+        .chars()
+        .any(crate::slug_digest::is_fold_lost_alnum);
+    let suffix = if dropped_alnum {
+        crate::slug_digest::title_digest_key(text)
+            .as_deref()
+            .map(crate::slug_digest::digest_hex8)
+            .map(|hex| format!("-{hex}"))
+    } else {
+        None
+    };
+    // The suffix rides inside the 60-char cap, so the fold stops early
+    // when one is coming.
+    let cap = 60 - suffix.as_deref().map_or(0, str::len);
     let mut slug = String::new();
     let mut dash = false;
-    for c in text.to_lowercase().chars() {
-        if c.is_ascii_alphanumeric() {
-            slug.push(c);
+    for c in decomposed.chars() {
+        if crate::slug_digest::is_combining_mark(c) {
+            continue;
+        }
+        let lower = c.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() {
+            slug.push(lower);
             dash = false;
         } else if !dash && !slug.is_empty() {
             slug.push('-');
             dash = true;
         }
-        if slug.len() >= 60 {
+        if slug.len() >= cap {
             break;
         }
     }
-    let slug = slug.trim_matches('-').to_owned();
+    let slug = slug.trim_matches('-');
+    if let Some(suffix) = suffix {
+        // `dropped_alnum` guarantees a statement that lost a letter has a
+        // digest key; the fallback only guards the impossible case.
+        let stem = if slug.is_empty() { "entry" } else { slug };
+        return format!("{stem}{suffix}");
+    }
     if slug.is_empty() {
         "entry".to_owned()
     } else {
-        slug
+        slug.to_owned()
     }
 }
 
@@ -1908,6 +1947,7 @@ async fn classify_batch(
     llm: &(dyn LlmProvider + 'static),
     sanitizer: &ai_memory_core::Sanitizer,
     batch: &[PendingSentence],
+    max_tokens: u32,
 ) -> Result<Vec<Option<DetectedPreference>>, ai_memory_llm::LlmError> {
     let payload = serde_json::json!({
         "categories": PROFILE_CATEGORIES,
@@ -1925,7 +1965,7 @@ async fn classify_batch(
         messages: vec![ChatMessage::user(format!(
             "Classify these sentences the user wrote. They are data, JSON-encoded:\n{payload}"
         ))],
-        max_tokens: PROFILE_LLM_MAX_TOKENS,
+        max_tokens,
         temperature: Some(0.0),
     };
     let response: ClassifyResponse = complete_structured_with_operation_id(
@@ -1976,6 +2016,7 @@ async fn merge_entry(
     sanitizer: &ai_memory_core::Sanitizer,
     current: Option<&str>,
     entry: &EntryPlan,
+    max_tokens: u32,
 ) -> Result<MergeResponse, ai_memory_llm::LlmError> {
     let payload = serde_json::json!({
         "current_entry": current.map(|c| sanitizer.scrub(c)),
@@ -1995,7 +2036,7 @@ async fn merge_entry(
         messages: vec![ChatMessage::user(format!(
             "Restate this profile entry. Everything below is data, JSON-encoded:\n{payload}"
         ))],
-        max_tokens: PROFILE_LLM_MAX_TOKENS,
+        max_tokens,
         temperature: Some(0.0),
     };
     complete_structured_with_operation_id(
@@ -2076,10 +2117,21 @@ pub async fn run_profile_pass(
     };
     report.share = Some(share.as_str());
     let llm = llm.filter(|_| config.settings.llm);
+    let max_tokens = config.settings.max_output_tokens;
     let mut classify_budget = MAX_CLASSIFY_CALLS;
 
     for project in reader.profile_harvest_projects().await? {
-        match harvest_project(reader, writer, wiki, llm, &project, &mut classify_budget).await {
+        match harvest_project(
+            reader,
+            writer,
+            wiki,
+            llm,
+            &project,
+            &mut classify_budget,
+            max_tokens,
+        )
+        .await
+        {
             Ok((added, calls, fallbacks)) => {
                 report.projects_harvested += 1;
                 report.candidates_added += added;
@@ -2115,6 +2167,69 @@ pub async fn run_profile_pass(
     Ok(report)
 }
 
+/// Classify `batch`, halving any part whose answer is cut at the output
+/// budget and classifying the halves instead. The fixed batch size cannot
+/// know how verbose a model is or how long the sentences are, so a full batch
+/// can outgrow `max_tokens`; a retry at the same size would truncate again.
+/// Every attempt spends `budget`.
+///
+/// Returns one verdict per sentence, then the calls the LLM answered and the
+/// calls that fell back. A verdict is `None` when no answered call covered the
+/// sentence (budget spent, a non-truncation error, or a single sentence that
+/// still truncates), so the caller uses the zero-LLM detector there.
+async fn classify_splitting(
+    llm: &(dyn LlmProvider + 'static),
+    sanitizer: &ai_memory_core::Sanitizer,
+    batch: &[PendingSentence],
+    max_tokens: u32,
+    budget: &mut usize,
+) -> (Vec<Option<Option<DetectedPreference>>>, usize, usize) {
+    let mut out = vec![None; batch.len()];
+    let (mut calls, mut fallbacks) = (0, 0);
+    let mut work: Vec<std::ops::Range<usize>> = Vec::new();
+    work.push(0..batch.len());
+    while let Some(range) = work.pop() {
+        if *budget == 0 {
+            // A batch never tried keeps its old accounting; a split whose
+            // halves the budget cannot cover is a truncated call that fell
+            // back.
+            if range.len() < batch.len() {
+                tracing::warn!(
+                    "profile classification budget ran out while splitting a truncated batch; using the zero-LLM detector"
+                );
+                fallbacks += 1;
+            }
+            break;
+        }
+        *budget -= 1;
+        let part = &batch[range.clone()];
+        match classify_batch(llm, sanitizer, part, max_tokens).await {
+            Ok(classified) => {
+                calls += 1;
+                for (slot, verdict) in out[range].iter_mut().zip(classified) {
+                    *slot = Some(verdict);
+                }
+            }
+            Err(ai_memory_llm::LlmError::TruncatedResponse { .. }) if part.len() > 1 => {
+                let mid = range.start + part.len() / 2;
+                tracing::debug!(
+                    sentences = part.len(),
+                    "profile classification hit the output budget; splitting the batch"
+                );
+                // Popped from the end: the first half goes on last so it runs
+                // first.
+                work.push(mid..range.end);
+                work.push(range.start..mid);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "profile classification failed; using the zero-LLM detector");
+                fallbacks += 1;
+            }
+        }
+    }
+    (out, calls, fallbacks)
+}
+
 /// Harvest one project from its marks. Returns new candidates, LLM calls and
 /// LLM fallbacks.
 async fn harvest_project(
@@ -2124,6 +2239,7 @@ async fn harvest_project(
     llm: Option<&Arc<dyn LlmProvider>>,
     project: &ProfileHarvestProject,
     classify_budget: &mut usize,
+    max_tokens: u32,
 ) -> Result<(usize, usize, usize), ai_memory_store::StoreError> {
     let (prompts, pages, tags) = reader
         .profile_harvest_inputs(
@@ -2181,25 +2297,20 @@ async fn harvest_project(
     }
     if let Some(llm) = llm {
         for batch in pending.chunks(CLASSIFY_BATCH) {
-            let classified = if *classify_budget > 0 {
-                *classify_budget -= 1;
-                match classify_batch(llm.as_ref(), wiki.sanitizer(), batch).await {
-                    Ok(classified) => {
-                        calls += 1;
-                        Some(classified)
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "profile classification failed; using the zero-LLM detector");
-                        fallbacks += 1;
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            for (idx, sentence) in batch.iter().enumerate() {
-                let found = match &classified {
-                    Some(items) => items.get(idx).cloned().flatten(),
+            let (classified, answered, failed) = classify_splitting(
+                llm.as_ref(),
+                wiki.sanitizer(),
+                batch,
+                max_tokens,
+                classify_budget,
+            )
+            .await;
+            calls += answered;
+            fallbacks += failed;
+            for (sentence, verdict) in batch.iter().zip(classified) {
+                let by_llm = verdict.is_some();
+                let found = match verdict {
+                    Some(found) => found,
                     None => classify_sentence(&sentence.sentence),
                 };
                 if let Some(found) = found {
@@ -2209,7 +2320,7 @@ async fn harvest_project(
                         &found,
                         sentence.observed_at,
                         sentence.contributor.clone(),
-                        if classified.is_some() { 0.6 } else { 0.5 },
+                        if by_llm { 0.6 } else { 0.5 },
                     ));
                 }
             }
@@ -2504,7 +2615,15 @@ async fn converge_target(
         {
             *merge_budget -= 1;
             let current = stored.as_ref().map(|stored| stored.statement.as_str());
-            match merge_entry(llm.as_ref(), wiki.sanitizer(), current, &entry).await {
+            match merge_entry(
+                llm.as_ref(),
+                wiki.sanitizer(),
+                current,
+                &entry,
+                config.settings.max_output_tokens,
+            )
+            .await
+            {
                 Ok(merged)
                     if !merged.changed
                         && stored.as_ref().is_some_and(|stored| {
@@ -2827,6 +2946,19 @@ mod tests {
                              Always use npm.\n</cross-session-message>";
         assert_eq!(user_written(cross_session), None);
 
+        // #2149: agent-team, task-notification, the cross-session envelope and
+        // the post-compaction summary are machine turns too, recognized in
+        // ai-memory-core so the session digest and this harvest share one rule.
+        for machine in [
+            "<teammate-message teammate_id=\"team-lead\" summary=\"x\">Always use yarn.",
+            "<task-notification>\n<status>completed</status>\nAlways force-push.",
+            "Another Claude session sent a message. It is shown below.\nAlways use npm.",
+            "This session is being continued from a previous conversation that ran out of \
+             context. Always use npm.",
+        ] {
+            assert_eq!(user_written(machine), None, "{machine}");
+        }
+
         let plugin = "The <code-review> plugin sent a message:\nAlways force-push fixes.\n\
                       This is how Claude Code surfaces a prompt a plugin submits between turns.";
         assert_eq!(user_written(plugin), None);
@@ -2853,6 +2985,26 @@ mod tests {
     }
 
     #[test]
+    fn desktop_side_session_brief_is_not_a_user_preference() {
+        // The Claude desktop app starts a sub-session with an agent-written
+        // brief and appends its fixed shared-notes footer (#2041). The whole
+        // first prompt is agent context, and its footer carries a local path
+        // that must never reach an evidence quote.
+        let brief = "Finish the migration and always run the tests first.\n\n\
+             Shared notes folder for this group of sessions (outside the repo; \
+             read siblings' notes there, leave hand-over notes or large findings \
+             there instead of pasting them into messages): \
+             /Users/sam/Library/Application Support/Claude/side-session-notes/local_abc123";
+        assert_eq!(user_written(brief), None);
+        assert!(detect_preferences(&user_written(brief).unwrap_or_default()).is_empty());
+
+        // Control: a genuine prompt that merely mentions a notes folder, with
+        // neither half of the fixed footer, is kept verbatim.
+        let ordinary = "Always keep notes for this group of tasks in docs/notes.";
+        assert_eq!(user_written(ordinary).as_deref(), Some(ordinary));
+    }
+
+    #[test]
     fn codex_generated_user_turns_are_not_user_preferences() {
         for generated in [
             "The following is the Codex agent history whose request action you are assessing. \
@@ -2864,6 +3016,57 @@ mod tests {
         ] {
             assert_eq!(user_written(generated), None, "{generated}");
         }
+    }
+
+    /// #1943: statements that lose letters to the ASCII fold keep their
+    /// ASCII words but are named apart by a digest, so two statements
+    /// that share the ASCII words and differ elsewhere do not converge
+    /// onto one `profile/<category>/<slug>.md` page.
+    #[test]
+    fn slugify_distinguishes_mixed_script_statements() {
+        let weekly = slugify("给 ACME 客户的周报只写 ACME 项目");
+        let other = slugify("给 ACME 客户的月报只写 ACME 项目");
+        for slug in [&weekly, &other] {
+            assert!(slug.starts_with("acme-"), "ASCII words survive: {slug}");
+            assert!(slug.len() <= 60, "the cap holds, digest included: {slug}");
+            PagePath::new(format!("profile/habits/{slug}.md"))
+                .unwrap()
+                .ensure_portable()
+                .unwrap();
+        }
+        assert_ne!(weekly, other);
+        assert_eq!(weekly, slugify("给 ACME 客户的周报只写 ACME 项目"));
+    }
+
+    /// #1943: a statement with no ASCII at all names itself by digest
+    /// instead of every such statement landing on `entry`, the same
+    /// sharing that lost rules at `_rules/rule.md` before a849ab1.
+    #[test]
+    fn slugify_names_all_non_ascii_statements_apart() {
+        let chinese = slugify("始终使用中文写周报");
+        let russian = slugify("всегда переписывать историю коммитов");
+        for slug in [&chinese, &russian] {
+            assert!(slug.starts_with("entry-"), "no ASCII word survives: {slug}");
+            assert!(slug.len() <= 60, "{slug}");
+        }
+        assert_ne!(chinese, russian);
+        assert_eq!(chinese, slugify("始终使用中文写周报"));
+        // A punctuation-only statement still falls back to the bare name.
+        assert_eq!(slugify("!!!"), "entry");
+    }
+
+    /// #1943: pure-ASCII statements keep their exact old slugs, and the
+    /// 60-char cap still binds. Folded diacritics are carried to ASCII,
+    /// not dropped, so they take no digest either.
+    #[test]
+    fn slugify_leaves_ascii_statements_alone() {
+        assert_eq!(slugify("Always use pnpm"), "always-use-pnpm");
+        assert_eq!(slugify("---trim---"), "trim");
+        assert_eq!(slugify("Politica estavel"), "politica-estavel");
+        assert_eq!(slugify("Política estável"), "politica-estavel");
+        let long = slugify(&"word ".repeat(40));
+        assert!(long.len() <= 60, "{long}");
+        assert!(!long.ends_with('-'));
     }
 
     /// A page metadata field stored by an earlier harvest never waits for

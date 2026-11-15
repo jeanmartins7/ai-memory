@@ -360,6 +360,12 @@ Output: a per-slice table on stdout plus
 provenance (commit, dataset sha, hardware, per-question scores).
 When publishing a baseline, copy the markdown into `docs/benchmarks/`.
 
+`--embeddings local` runs keep haystack document vectors in
+`evals/.cache/embeddings/` (gitignored) and reuse them on the next run, so a
+repeat run skips most of its embedding work; query embeddings stay live.
+`--no-embedding-cache` runs cold. See
+[Reuse haystack embeddings across runs](../docs/benchmarks/README.md#reuse-haystack-embeddings-across-runs-local-mode).
+
 ### Bundled coding-session retrieval corpus
 
 `--dataset-variant coding-v1` selects four synthetic questions in
@@ -480,7 +486,20 @@ knobs like `pin_first` / `include_superseded` can be A/B'd;
 `query`/`workspace`/`project`/`limit` are reserved). Each has a
 `--candidate-*` twin (`--candidate-embeddings`, `--candidate-reranker`,
 `--candidate-server-env`, `--candidate-query-arg`); a candidate knob left
-unset mirrors the baseline.
+unset mirrors the baseline. The report's config line names every
+`--server-env` variable, but prints `<redacted>` for the value of any name
+with a `KEY`, `APIKEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`,
+`CREDENTIALS` or `HEADERS` word
+(`OPENAI_API_KEY`, `AI_MEMORY_LLM_HEADERS`), so a provider key passed for
+`--reranker` never reaches a published report. The values it keeps, and
+every `--query-arg` value, also pass through the built-in sanitizer patterns
+that hook capture applies, so a password inside a URL shows as
+`[REDACTED:<kind>]`.
+
+The spawned servers do not inherit `AI_MEMORY_*` settings from the evaluator's
+environment. Pass intended server settings through `--server-env` or
+`--candidate-server-env` so the report records them. System settings such as
+`PATH`, home directories and certificate configuration remain inherited.
 
 ```bash
 # Determinism check — baseline == candidate ⇒ accuracy/context delta = 0:
@@ -499,6 +518,44 @@ Output: `evals/runs/<timestamp>-retrieval/report.{json,md}` — the JSON is
 `{ baseline, candidate, delta }`; the markdown carries both per-slice
 triples and an `overall` delta table. Publish full-dataset A/B numbers in
 `docs/benchmarks/retrieval-ab-r2.md`.
+
+### `retrieval-compare` — two saved runs, question by question
+
+An A/B run compares two configs of one build in one process. A release
+comparison pairs runs of two builds made on different days, and its slice
+averages say how much moved, not which questions moved or how.
+`retrieval-compare` reads the `report.json` of two single-config runs (the
+run directory or the file), pairs questions by id, and prints:
+
+- hit@k and recall@k over the questions both runs scored, with the
+  questions gained and lost at each k;
+- every question whose first hit moved: the cutoffs it crossed, its recall
+  at the largest k and its latency on each side, widest moves and losses
+  first;
+- per question type, how many moved earlier and how many later.
+
+Runs that share questions must use the same `--ks` cutoffs. Paired questions
+used for optional `--fts` marking must use these cutoffs too. Every question in a
+report must carry the same complete hit/recall cutoff grid; incompatible or
+incomplete grids are refused before a comparison table is printed. Configs
+and question sets may differ, and older reports without later optional fields
+still load. Empty runs and runs with no shared questions remain supported.
+
+```bash
+cargo run --release -p ai-memory-eval -- retrieval-compare \
+    --baseline evals/runs/<previous release local run> \
+    --candidate evals/runs/<release candidate local run> \
+    --fts evals/runs/<release candidate FTS run>
+```
+
+Moves of one cutoff in both directions, spread across types, are what
+questions near a cutoff trading places look like. Moves that skip cutoffs,
+all go one way, or cluster in one type point at a ranking change (#1854).
+`--fts` takes the candidate build's FTS run and marks moved questions whose
+candidate row equals the FTS row in every hit, recall, retrieved-session
+and context-token value. With a latency at or above the 250 ms query
+embedding wait, that is a local query that ran without its vector. An A/B
+`report.json` is refused; compare the single-config runs instead.
 
 Strict `recall-all@k` scores each question as 1 only when every evidence
 session appears in the top k distinct retrieved sessions, otherwise 0.

@@ -45,7 +45,10 @@ async fn make_state_with_chain(
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -56,7 +59,7 @@ async fn make_state_with_chain(
         data_dir: tmp.path().to_path_buf(),
         bind: "127.0.0.1:0".to_string(),
         home_dir: None,
-        bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap_gate: ai_memory_mcp::BootstrapGate::default(),
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
@@ -238,6 +241,7 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
                         title: format!("{label} obs {i}"),
                         body: "body".into(),
                         importance: 5,
+                        file_path: None,
                     },
                     &Sanitizer::builtin(),
                 ))
@@ -466,6 +470,7 @@ async fn purge_session_dry_run_reports_the_same_counts_the_confirmed_purge_will(
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -574,6 +579,47 @@ async fn purge_session_dry_run_does_not_dispatch_admission_webhook() {
     assert!(
         outcome.is_err(),
         "a dry run must not dispatch the purge-session admission webhook"
+    );
+}
+
+/// A confirmed purge of a session that is not in the scope answers 404
+/// without telling the admission webhook and without a pre-purge checkpoint.
+#[tokio::test]
+async fn purge_session_unknown_session_is_404_before_admission_and_checkpoint() {
+    let (url, rx) = spawn_capture_hook().await;
+    let tmp = TempDir::new().unwrap();
+    let chain = AdmissionChain::new(vec![WebhookConfig {
+        name: "async-mirror".into(),
+        url,
+        timeout_ms: 2_000,
+        failure_policy: FailurePolicy::Ignore,
+        events: vec![AdmissionOp::PurgeSession],
+        blocking: false,
+    }])
+    .unwrap();
+    let (state, store) = make_state_with_chain(&tmp, Some(chain)).await;
+    seed_ended_session_summary(
+        &store,
+        &state.wiki,
+        "default",
+        "audit",
+        SessionId::new(),
+        "uncommitted summary body",
+    )
+    .await;
+    let commits = state.wiki.git().commit_count();
+
+    let resp = post_purge_session(state.clone(), "default", "audit", SessionId::new()).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        state.wiki.git().commit_count(),
+        commits,
+        "a refused purge must not write its pre-purge checkpoint"
+    );
+    let outcome = tokio::time::timeout(std::time::Duration::from_millis(300), rx).await;
+    assert!(
+        outcome.is_err(),
+        "a purge of an unknown session must not dispatch the admission webhook"
     );
 }
 
@@ -782,6 +828,7 @@ async fn purge_session_confirm_true_and_dry_run_true_still_only_previews() {
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -893,6 +940,7 @@ async fn purge_session_dry_run_and_confirmed_purge_both_report_collateral_damage
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -1025,6 +1073,58 @@ async fn omitted_confirm_is_the_documented_400_on_every_guarded_route() {
             "{uri}: the refusal must name the flag: {body}"
         );
     }
+}
+
+/// An `older_than_days` too large for a microsecond timestamp means "older
+/// than anything stored", so it expires nothing. The cutoff used to
+/// overflow: a debug build panicked and a release build wrapped it into the
+/// future, which expired every open handoff in the scope.
+#[tokio::test]
+async fn expire_handoffs_with_a_huge_older_than_days_expires_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "baton", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .insert_handoff(NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: None,
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            cwd: None,
+            summary: "fresh baton".into(),
+            open_questions: vec![],
+            next_steps: vec![],
+            files_touched: vec![],
+            owner_user: None,
+        })
+        .await
+        .unwrap();
+
+    let resp = post(
+        state,
+        "/admin/handoffs/expire",
+        json!({
+            "workspace": "default",
+            "project": "baton",
+            "confirm": true,
+            "older_than_days": 200_000_000_u32,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["expired"], 0, "{body}");
 }
 
 /// Non-existent project must return 404.
@@ -1233,7 +1333,10 @@ async fn purge_project_rejecting_admission_leaves_source_intact() {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -1245,7 +1348,7 @@ async fn purge_project_rejecting_admission_leaves_source_intact() {
         db_path: store.db_path().to_path_buf(),
         bind: "127.0.0.1:0".to_string(),
         home_dir: None,
-        bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap_gate: ai_memory_mcp::BootstrapGate::default(),
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
@@ -1339,7 +1442,10 @@ async fn purge_project_idempotent_second_call_is_404() {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki: state_a.wiki.clone(),
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -1351,7 +1457,7 @@ async fn purge_project_idempotent_second_call_is_404() {
         db_path: store.db_path().to_path_buf(),
         bind: "127.0.0.1:0".to_string(),
         home_dir: None,
-        bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        bootstrap_gate: ai_memory_mcp::BootstrapGate::default(),
         token_pepper: None,
         active_project: ai_memory_core::ActiveProject::new(),
         scope_invalidator: None,
@@ -1614,6 +1720,7 @@ async fn purge_project_dry_run_counts_observations_stamped_from_another_projects
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -1757,6 +1864,7 @@ async fn purge_project_dry_run_and_confirmed_purge_both_report_collateral_damage
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))

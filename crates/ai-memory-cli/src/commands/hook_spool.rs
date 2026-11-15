@@ -274,7 +274,8 @@ fn now_ms() -> u64 {
 /// same millisecond without clobbering an earlier event.
 ///
 /// # Errors
-/// Returns an error only when the spool file cannot be written.
+/// Returns an error when the entry exceeds the spool's byte limit or the
+/// spool file cannot be written.
 #[cfg(test)]
 pub fn enqueue(spool: &Path, entry: &SpoolEntry) -> std::io::Result<()> {
     enqueue_with_config(spool, entry, None)
@@ -296,6 +297,29 @@ pub fn enqueue_with_config(
     let tmp = spool.join(format!("{name}.tmp"));
     let final_path = spool.join(&name);
     let bytes = serde_json::to_vec(entry)?;
+    // An entry past MAX_SPOOL_ENTRY_BYTES can be written but never read back,
+    // so once spooled it can never be sent or charged an attempt and the TTL /
+    // retry cap never reach it — it wedges the queue forever (#2179). The
+    // usual cause is a base64 image in `tool_response`; the server caps that to
+    // TOOL_EXCERPT_MAX_BYTES on receipt, so the multi-MB payload carries no
+    // excerpt worth keeping. Drop it here, as the at-capacity path drops one
+    // event, instead of writing megabytes that can only ever be skipped.
+    if bytes.len() as u64 > MAX_SPOOL_ENTRY_BYTES {
+        eprintln!(
+            "{}",
+            crate::localization::process_diagnostic(&format!(
+                "ai-memory: hook-spool event over {MAX_SPOOL_ENTRY_BYTES} bytes \
+                 ({} bytes); dropping one UNDELIVERED event",
+                bytes.len()
+            ))
+        );
+        // A caller can advance a transcript cursor on success. The next
+        // hook must still be able to carry the usage from this dropped event.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "hook spool entry exceeds its byte limit",
+        ));
+    }
     write_private(&tmp, &bytes)?;
     // The capacity lock only serializes concurrent count-then-rename checks
     // so a burst cannot overshoot the cap. If another enqueuer holds it past
@@ -319,7 +343,10 @@ pub fn enqueue_with_config(
     if total_spool_entries(spool)? >= MAX_SPOOL_FILES {
         let _ = std::fs::remove_file(&tmp);
         eprintln!(
-            "ai-memory: hook-spool at capacity ({MAX_SPOOL_FILES}); dropping one new UNDELIVERED event"
+            "{}",
+            crate::localization::process_diagnostic(&format!(
+                "ai-memory: hook-spool at capacity ({MAX_SPOOL_FILES}); dropping one new UNDELIVERED event"
+            ))
         );
         return Ok(());
     }
@@ -1444,8 +1471,11 @@ pub async fn drain_with_live_token(
         Ok(recovery) => recovery,
         Err(error) => {
             eprintln!(
-                "ai-memory hook-drain warning: could not recover stranded temp entries in {}: {error}",
-                spool.display()
+                "{}",
+                crate::localization::process_diagnostic(&format!(
+                    "ai-memory hook-drain warning: could not recover stranded temp entries in {}: {error}",
+                    spool.display()
+                ))
             );
             TempRecovery {
                 unreadable: 1,
@@ -1455,11 +1485,14 @@ pub async fn drain_with_live_token(
     };
     if recovery.adopted > 0 || recovery.dropped > 0 || recovery.unreadable > 0 {
         eprintln!(
-            "ai-memory hook-drain: recovered {}, dropped {} malformed, left {} unreadable temp entr{}",
-            recovery.adopted,
-            recovery.dropped,
-            recovery.unreadable,
-            if recovery.unreadable == 1 { "y" } else { "ies" }
+            "{}",
+            crate::localization::process_diagnostic(&format!(
+                "ai-memory hook-drain: recovered {}, dropped {} malformed, left {} unreadable temp entr{}",
+                recovery.adopted,
+                recovery.dropped,
+                recovery.unreadable,
+                if recovery.unreadable == 1 { "y" } else { "ies" }
+            ))
         );
     }
     let (mut files, unreadable) = match list_entries(spool) {
@@ -1468,18 +1501,24 @@ pub async fn drain_with_live_token(
             // Never silent: a spool we cannot read is an outage, not an idle
             // pass, and the difference is invisible from the exit code.
             eprintln!(
-                "ai-memory hook-drain warning: could not list the spool directory {}: {e}; \
+                "{}",
+                crate::localization::process_diagnostic(&format!(
+                    "ai-memory hook-drain warning: could not list the spool directory {}: {e}; \
                  no events were attempted",
-                spool.display()
+                    spool.display()
+                ))
             );
             return DrainResult::default();
         }
     };
     if unreadable > 0 {
         eprintln!(
-            "ai-memory hook-drain warning: skipped {unreadable} unreadable spool entr{} in {}",
-            if unreadable == 1 { "y" } else { "ies" },
-            spool.display()
+            "{}",
+            crate::localization::process_diagnostic(&format!(
+                "ai-memory hook-drain warning: skipped {unreadable} unreadable spool entr{} in {}",
+                if unreadable == 1 { "y" } else { "ies" },
+                spool.display()
+            ))
         );
     }
     files.sort();
@@ -2226,6 +2265,13 @@ fn completed_tombstone_for_path(path: &Path) -> bool {
     matches == 1
 }
 
+/// Whether a spool file is larger than a drainable entry. Such an entry is
+/// undeliverable by construction — [`read_spool_entry_bytes`] refuses it — so
+/// the drain drops it instead of skipping it forever (#2179).
+fn file_exceeds_spool_cap(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|meta| meta.len() > MAX_SPOOL_ENTRY_BYTES)
+}
+
 fn read_spool_entry_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
     let file = File::open(path)?;
@@ -2253,7 +2299,17 @@ fn load_live_entry(path: &Path, result: &mut DrainResult) -> Option<SpoolEntry> 
         return None;
     }
     let Ok(bytes) = read_spool_entry_bytes(path) else {
-        result.remaining += 1;
+        // An entry past MAX_SPOOL_ENTRY_BYTES can never be read back, so it can
+        // never be sent or charged an attempt and the TTL / retry cap never
+        // reach it. Drop it as undelivered rather than let it wedge the queue
+        // forever, and clean up entries an older binary already spooled whole
+        // (#2179). A transient read error (file busy) keeps the entry.
+        if file_exceeds_spool_cap(path) {
+            let _ = std::fs::remove_file(path);
+            result.dropped += 1;
+        } else {
+            result.remaining += 1;
+        }
         return None;
     };
     let Ok(mut entry) = serde_json::from_slice::<SpoolEntry>(&bytes) else {
@@ -2407,7 +2463,8 @@ impl<'a> ProfileTokens<'a> {
 /// Rewrite `url`'s scheme and authority onto `server_url`, keeping path and
 /// query. Used only to retry an endpoint that has already proven unreachable.
 fn reroot_url(url: &str, server_url: &str) -> Option<String> {
-    let base = server_url.trim_end_matches('/');
+    // Only the origin: the spooled path already carries any mount path.
+    let (base, _) = crate::http_client::split_origin_and_path(server_url);
     let rest = url.split_once("://").map(|(_, r)| r)?;
     let path_and_query = rest.find(['/', '?']).map(|i| &rest[i..]).unwrap_or("");
     Some(format!("{base}{path_and_query}"))
@@ -2503,8 +2560,11 @@ fn rewrite_entry(path: &Path, entry: &SpoolEntry) -> std::io::Result<()> {
 fn note_retry_persist(outcome: std::io::Result<()>) -> bool {
     if outcome.is_err() {
         eprintln!(
-            "ai-memory hook warning: failed to persist spool retry count; \
+            "{}",
+            crate::localization::process_diagnostic(
+                "ai-memory hook warning: failed to persist spool retry count; \
              event may retry until it ages out"
+            )
         );
         return false;
     }
@@ -3372,6 +3432,55 @@ mod tests {
     }
 
     #[test]
+    fn enqueue_drops_an_oversize_event_instead_of_spooling_it() {
+        // A PostToolUse event whose tool_response carries a multi-MB base64
+        // image serializes past the spool cap. It must not be written: once
+        // spooled it could never be read back, so it would wait in the queue
+        // forever (#2179).
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        let huge = "a".repeat(MAX_SPOOL_ENTRY_BYTES as usize + 1);
+        let entry = entry_for(
+            "https://x/hook?event=post-tool-use&agent=codex".into(),
+            format!(r#"{{"session_id":"s","tool_response":"{huge}"}}"#),
+            None,
+            false,
+        );
+        let error = enqueue(&spool, &entry).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            list_entries(&spool).unwrap().0.is_empty(),
+            "an over-cap event must be dropped, not written to the spool"
+        );
+    }
+
+    #[test]
+    fn load_live_entry_drops_an_oversize_entry_instead_of_leaving_it() {
+        // An entry an older binary already spooled whole is undeliverable:
+        // read_spool_entry_bytes refuses it, so the drain used to skip it as
+        // "still queued" every pass forever. It must now be dropped as
+        // undelivered and removed from disk (#2179).
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        create_spool_dir(&spool).unwrap();
+        let path = spool.join("0000000000001-1-0000000000000000-x.json");
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_SPOOL_ENTRY_BYTES + 1).unwrap();
+
+        let mut result = DrainResult::default();
+        assert!(load_live_entry(&path, &mut result).is_none());
+        assert_eq!(
+            result.dropped, 1,
+            "an over-cap entry is an undelivered drop"
+        );
+        assert_eq!(result.remaining, 0, "it must not be left queued");
+        assert!(
+            !path.exists(),
+            "the undeliverable entry is removed from disk"
+        );
+    }
+
+    #[test]
     fn tombstone_sweep_is_global_and_bounded_by_age_and_count() {
         let temp = tempfile::tempdir().unwrap();
         let spool = spool_dir(temp.path());
@@ -3425,13 +3534,10 @@ mod tests {
     /// 7-day TTL. An unreachable must not charge the attempt budget.
     #[tokio::test]
     async fn unreachable_outage_never_charges_attempt_budget() {
-        // A port with nothing on it: bind, read the address, then drop.
-        let dead = {
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let a = l.local_addr().unwrap();
-            drop(l);
-            a
-        };
+        // Bound but never listening: connections are refused and no parallel
+        // test can take the port (#2030).
+        let dead_port = ai_memory_test_support::refusing_port();
+        let dead = dead_port.addr();
 
         let tmp = tempfile::tempdir().unwrap();
         let spool = spool_dir(tmp.path());
@@ -3475,12 +3581,10 @@ mod tests {
         use tokio::io::AsyncWriteExt as _;
 
         // Phase 1 — outage: nothing listens where the events were captured.
-        let dead_addr = {
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let a = l.local_addr().unwrap();
-            drop(l);
-            a
-        };
+        // Bound but never listening: connections are refused and no parallel
+        // test can take the port (#2030).
+        let dead_addr_port = ai_memory_test_support::refusing_port();
+        let dead_addr = dead_addr_port.addr();
 
         let tmp = tempfile::tempdir().unwrap();
         let spool = spool_dir(tmp.path());
@@ -3506,11 +3610,9 @@ mod tests {
         }
         assert_eq!(sorted_attempts(&spool), vec![0, 0, 0]);
 
-        // Phase 2 — recovery: the server restarts on the same port. The
-        // listener never accepted, so the port carries no TIME_WAIT and the
-        // rebind is immediate.
-        let listener = tokio::net::TcpListener::bind(dead_addr)
-            .await
+        // Phase 2 — recovery: the server restarts on the same port, which
+        // the test held reserved during the outage.
+        let listener = tokio::net::TcpListener::from_std(dead_addr_port.into_listener())
             .expect("restart on the same port after the outage");
         tokio::spawn(async move {
             while let Ok((mut s, _)) = listener.accept().await {
@@ -4286,13 +4388,10 @@ mod tests {
         )
         .await;
 
-        // A port with nothing on it: bind, read the address, then drop.
-        let dead = {
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let a = l.local_addr().unwrap();
-            drop(l);
-            a
-        };
+        // Bound but never listening: connections are refused and no parallel
+        // test can take the port (#2030).
+        let dead_port = ai_memory_test_support::refusing_port();
+        let dead = dead_port.addr();
 
         let tmp = tempfile::tempdir().unwrap();
         let spool = spool_dir(tmp.path());
@@ -4353,6 +4452,21 @@ mod tests {
         );
     }
 
+    /// A configured `server_url` with a mount path (`/wiki`) must only lend
+    /// the retry its scheme and authority: the spooled URL already carries the
+    /// mount path, and repeating it 404s the retry until the entry is dropped.
+    #[test]
+    fn reroot_keeps_the_spooled_path_under_a_mounted_server_url() {
+        assert_eq!(
+            reroot_url(
+                "http://127.0.0.1:4444/wiki/hook?event=x",
+                "http://127.0.0.1:5555/wiki/"
+            )
+            .as_deref(),
+            Some("http://127.0.0.1:5555/wiki/hook?event=x")
+        );
+    }
+
     /// #493: the envelope freezes the address at capture time, so a server
     /// that came back on a different port leaves the whole spool addressed
     /// somewhere dead. Skipping those entries stops them blocking the queue,
@@ -4366,12 +4480,10 @@ mod tests {
             "200 OK",
         )
         .await;
-        let dead = {
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let a = l.local_addr().unwrap();
-            drop(l);
-            a
-        };
+        // Bound but never listening: connections are refused and no parallel
+        // test can take the port (#2030).
+        let dead_port = ai_memory_test_support::refusing_port();
+        let dead = dead_port.addr();
 
         let tmp = tempfile::tempdir().unwrap();
         // Point this store's config at the server that is actually up.
@@ -4420,12 +4532,10 @@ mod tests {
     async fn a_profile_entry_on_a_dead_loopback_port_is_not_rerouted_to_the_default() {
         let default_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let live = serve_counting_hook(default_hits.clone(), "200 OK").await;
-        let dead = {
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let a = l.local_addr().unwrap();
-            drop(l);
-            a
-        };
+        // Bound but never listening: connections are refused and no parallel
+        // test can take the port (#2030).
+        let dead_port = ai_memory_test_support::refusing_port();
+        let dead = dead_port.addr();
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join("config.toml"),

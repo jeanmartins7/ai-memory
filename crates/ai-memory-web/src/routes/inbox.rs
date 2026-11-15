@@ -2,13 +2,16 @@
 
 use crate::{
     state::WebState,
-    templates::{agent_label, encode_segment, humanize, project_href},
+    templates::{agent_label, encode_segment, project_href},
     views::{InboxView, MessageRow, RecipientOption, ScopeOption},
 };
 use ai_memory_core::{
     ActorContext, AgentKind, AuthLevel, Capability, MessageBox, MessageState, NewAgentMessage,
+    ProjectId,
 };
-use ai_memory_store::{ProjectAccess, lookup_existing_scope_guarded};
+use ai_memory_store::{
+    ProjectAccess, ScopeResolutionError, lookup_existing_scope_guarded, lookup_project_id_guarded,
+};
 use askama::Template;
 use axum::{
     Json,
@@ -41,6 +44,7 @@ fn mailbox_href(workspace: &str, project: &str, outbox: bool, offset: usize) -> 
 }
 
 pub(crate) async fn handler(
+    axum::Extension(i18n): axum::Extension<ai_memory_core::i18n::Localizer>,
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     legacy: Option<axum::Extension<ai_memory_core::LegacyBrowserAuth>>,
@@ -59,13 +63,22 @@ pub(crate) async fn handler(
         .into_iter()
         .map(|c| ((c.workspace_name, c.project_name), c.pending))
         .collect();
+    // The default mailbox is picked from the project list, so it carries the
+    // id: a name another project also answers to (a legacy key) cannot make
+    // the landing page refuse for a project nobody asked for by name.
     let requested = match (query.workspace, query.project) {
-        (Some(w), Some(p)) => (w, p),
+        (Some(w), Some(p)) => (w, p, None),
         (None, None) => projects
             .iter()
             .find(|p| pending.contains_key(&(p.workspace_name.clone(), p.project_name.clone())))
             .or_else(|| projects.first())
-            .map(|p| (p.workspace_name.clone(), p.project_name.clone()))
+            .map(|p| {
+                (
+                    p.workspace_name.clone(),
+                    p.project_name.clone(),
+                    p.project_id.parse::<ProjectId>().ok(),
+                )
+            })
             .unwrap_or_default(),
         _ => {
             return (
@@ -75,7 +88,7 @@ pub(crate) async fn handler(
                 .into_response();
         }
     };
-    let (workspace, project) = requested;
+    let (workspace, project, default_project_id) = requested;
     let mailbox = match query.mailbox.as_deref() {
         None | Some("inbox") => MessageBox::Inbox,
         Some("outbox") => MessageBox::Outbox,
@@ -100,12 +113,38 @@ pub(crate) async fn handler(
         }
         href
     };
+    // An ambiguous name is a data problem the operator fixes with
+    // `merge-project`, not a reason to lose the whole console: keep the page,
+    // show no messages and say why.
+    let mut warning = String::new();
     let scope = if workspace.is_empty() && project.is_empty() {
         None
     } else {
-        match super::resolve_read_scope(&state, viewer, &workspace, &project).await {
+        let resolved = match default_project_id {
+            Some(id) => {
+                lookup_project_id_guarded(
+                    &state.reader,
+                    &workspace,
+                    id,
+                    viewer,
+                    ProjectAccess::Read,
+                )
+                .await
+            }
+            None => super::resolve_read_scope(&state, viewer, &workspace, &project).await,
+        };
+        match resolved {
             Ok(s) => Some(s),
-            Err(e) => return super::page::refusal_response(&e),
+            Err(e @ ScopeResolutionError::ProjectNameAmbiguous { .. }) => {
+                let reason = if i18n.tag() == "en" {
+                    format!("{e}.")
+                } else {
+                    i18n.text("web-invalid-scope")
+                };
+                warning = format!("{reason} {}", i18n.text("web-mailbox-ambiguous-name"));
+                None
+            }
+            Err(e) => return super::page::localized_refusal_response(&i18n, &e),
         }
     };
     let recipients = directory
@@ -191,22 +230,27 @@ pub(crate) async fn handler(
                 subject: m
                     .subject
                     .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "Untitled message".into()),
+                    .unwrap_or_else(|| i18n.text("web-untitled-message")),
                 body: m.body,
                 from,
                 to,
                 agent: m
                     .to_agent
                     .map(|a| agent_label(a).to_owned())
-                    .unwrap_or_else(|| "Any project agent".into()),
+                    .unwrap_or_else(|| i18n.text("web-any-project-agent")),
                 state: m.state.as_str().into(),
-                state_label: match m.state {
-                    MessageState::Pending => "Queued",
-                    MessageState::Claimed => "Collected",
-                    MessageState::Cancelled => "Cancelled",
-                    MessageState::Editing => "Editing",
+                state_label: if i18n.tag() == "en" {
+                    match m.state {
+                        MessageState::Pending => "Queued",
+                        MessageState::Claimed => "Collected",
+                        MessageState::Cancelled => "Cancelled",
+                        MessageState::Editing => "Editing",
+                    }
+                    .to_owned()
+                } else {
+                    i18n.status(m.state.as_str())
                 },
-                when: humanize(&m.created_at.to_string()),
+                when: i18n.relative(&m.created_at.to_string()),
             }
         })
         .collect();
@@ -227,6 +271,7 @@ pub(crate) async fn handler(
         })
         .collect();
     let view = InboxView {
+        i18n: i18n.clone(),
         pending_total: scopes
             .iter()
             .fold(0_u64, |total, s| total.saturating_add(s.pending)),
@@ -254,6 +299,7 @@ pub(crate) async fn handler(
             .iter()
             .any(|r| r.workspace == workspace && r.project == project),
         needs_write_token: legacy.is_some(),
+        warning,
         project_href: project_href(&workspace, &project),
         workspace,
         project,

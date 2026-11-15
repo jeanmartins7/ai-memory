@@ -114,6 +114,7 @@ async fn say(
                 title: "obs".into(),
                 body: body.into(),
                 importance: 5,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -266,7 +267,7 @@ async fn a_habit_from_two_projects_becomes_a_global_entry_once() {
     let entries = fx
         .store
         .reader
-        .profile_entries(global.workspace_id, global.project_id, 50)
+        .profile_entries(global.workspace_id, global.project_id)
         .await
         .unwrap();
     let digest = render_digest(&entries, &Default::default(), 3_000, false, false).unwrap();
@@ -492,6 +493,46 @@ async fn injected_instructions_and_ai_memory_blocks_are_never_candidates() {
         statements.len(),
         1,
         "injected text became a candidate: {statements:?}"
+    );
+}
+
+/// A desktop app sub-session's agent-written brief, with its fixed shared-notes
+/// footer, is never the user's words, and its local filesystem path must not
+/// reach a candidate quote (#2041).
+#[tokio::test]
+async fn desktop_side_session_briefs_are_never_candidates() {
+    let fx = fixture().await;
+    let alpha = project(&fx, "alpha").await;
+    let brief = "Finish the migration and always run the tests first in every project.\n\n\
+         Shared notes folder for this group of sessions (outside the repo; read siblings' \
+         notes there, leave hand-over notes or large findings there instead of pasting them \
+         into messages): /Users/sam/Library/Application Support/Claude/side-session-notes/local_abc123";
+    prompt(&fx, alpha, brief, 1).await;
+    // Control: a genuine user preference the pass must still keep.
+    prompt(
+        &fx,
+        alpha,
+        "Always use pnpm for installs in every project.",
+        2,
+    )
+    .await;
+
+    pass(&fx, &single_user()).await;
+    let statements = candidate_statements(&fx);
+    assert!(
+        statements.iter().any(|s| s.contains("pnpm")),
+        "the user's own sentence was lost: {statements:?}"
+    );
+    assert_eq!(
+        statements.len(),
+        1,
+        "the agent-written brief became a candidate: {statements:?}"
+    );
+    assert!(
+        !statements
+            .iter()
+            .any(|s| s.contains("side-session-notes") || s.contains("/Users/")),
+        "a local filesystem path reached a candidate: {statements:?}"
     );
 }
 
@@ -996,6 +1037,58 @@ async fn a_forgotten_entry_is_not_recreated_until_said_again() {
     assert_eq!(profile_pages(&fx, "_global").len(), 1);
 }
 
+/// An entry the harvester wrote stays its own after the scope grows past 200
+/// pages. The scope read stopped at 200 rows in path order, so an entry
+/// sorting after them looked deleted by the user and was reported forgotten
+/// instead of being kept up to date (#1946).
+#[tokio::test]
+async fn an_entry_past_two_hundred_profile_pages_is_not_forgotten() {
+    let fx = fixture().await;
+    let alpha = project(&fx, "alpha").await;
+    prompt(&fx, alpha, "Always use pnpm in every project.", 1).await;
+    pass(&fx, &single_user()).await;
+    let entry = profile_pages(&fx, "_global")[0].0.clone();
+    let global = ai_memory_store::lookup_global_scope(&fx.store.reader)
+        .await
+        .unwrap()
+        .unwrap();
+    // Hand-written pages that sort ahead of the harvested entry.
+    for i in 0..200 {
+        fx.store
+            .writer
+            .upsert_page(ai_memory_core::NewPage {
+                workspace_id: global.workspace_id,
+                project_id: global.project_id,
+                path: PagePath::new(format!("profile/aaa/note-{i:03}.md")).unwrap(),
+                title: format!("Note {i}"),
+                body: format!("Hand-written note number {i}."),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+    }
+    assert!(entry.as_str() > "profile/aaa/note-199.md", "{entry}");
+
+    let report = pass(&fx, &single_user()).await;
+    assert!(report.errors.is_empty(), "{report:?}");
+    assert_eq!(
+        report.entries_unchanged, 1,
+        "the entry past the old cap must still be seen as current: {report:?}"
+    );
+    assert!(
+        profile_pages(&fx, "_global")
+            .iter()
+            .any(|(path, _, _)| *path == entry)
+    );
+}
+
 /// A private profile only ever holds its own operator's words: Bob's profile
 /// never receives Alice's prompt, and Alice's holds hers (control).
 #[tokio::test]
@@ -1190,7 +1283,13 @@ struct FakeProfileLlm {
     /// Report `changed: false` from the merge: the evidence only corroborates.
     merge_unchanged: bool,
     fail: bool,
+    /// Answer a classification of at least this many sentences as cut at
+    /// the output budget.
+    truncate_from: Option<usize>,
     seen: Arc<Mutex<Vec<String>>>,
+    budgets: Arc<Mutex<Vec<(String, u32)>>>,
+    /// Sentence count of every classification call, in order.
+    classify_sizes: Arc<Mutex<Vec<usize>>>,
 }
 
 #[async_trait::async_trait]
@@ -1219,10 +1318,27 @@ impl LlmProvider for FakeProfileLlm {
         if self.fail {
             return Err(LlmError::NotConfigured("provider down".into()));
         }
+        let max_tokens = request.max_tokens;
         let system = request.system.unwrap_or_default();
+        let operation = if system.contains("You classify sentences") {
+            "classify"
+        } else {
+            "merge"
+        };
+        self.budgets
+            .lock()
+            .unwrap()
+            .push((operation.to_owned(), max_tokens));
         if system.contains("You classify sentences") {
             let payload = request.messages[0].content.clone();
             let count = payload.matches("\"index\"").count();
+            self.classify_sizes.lock().unwrap().push(count);
+            if self.truncate_from.is_some_and(|from| count >= from) {
+                return Err(LlmError::TruncatedResponse {
+                    model: "fake-model".into(),
+                    completion_tokens: None,
+                });
+            }
             let items: Vec<serde_json::Value> = (0..count)
                 .map(|index| {
                     serde_json::json!({
@@ -1263,8 +1379,20 @@ async fn the_llm_classifies_and_merges_when_configured() {
         merge_statement: "Use pnpm for every JavaScript project.".into(),
         ..FakeProfileLlm::default()
     };
-    let report = pass_with(&fx, &single_user(), Arc::new(llm)).await;
+    let budgets = llm.budgets.clone();
+    let mut config = single_user();
+    config.settings.max_output_tokens = 4_000;
+    let report = pass_with(&fx, &config, Arc::new(llm)).await;
     assert!(report.llm_calls >= 2, "{report:?}");
+    let budgets = budgets.lock().unwrap();
+    assert!(
+        budgets.contains(&("classify".to_owned(), 4_000)),
+        "{budgets:?}"
+    );
+    assert!(
+        budgets.contains(&("merge".to_owned(), 4_000)),
+        "{budgets:?}"
+    );
     let pages = profile_pages(&fx, "_global");
     assert_eq!(pages.len(), 1, "{pages:?}");
     assert!(pages[0].0.starts_with("profile/tools/"), "{pages:?}");
@@ -1320,7 +1448,7 @@ async fn injected_instructions_stay_data() {
     let entries = fx
         .store
         .reader
-        .profile_entries(global.workspace_id, global.project_id, 50)
+        .profile_entries(global.workspace_id, global.project_id)
         .await
         .unwrap();
     let digest = render_digest(&entries, &Default::default(), 3_000, false, false).unwrap();
@@ -1352,6 +1480,95 @@ async fn a_provider_failure_falls_back_to_the_zero_llm_path() {
             .1
             .contains("Always use pnpm for installs in every project.")
     );
+}
+
+/// A classification cut at the output budget is halved and the halves are
+/// classified, so every sentence still gets an LLM verdict instead of falling
+/// back to the zero-LLM detector.
+#[tokio::test]
+async fn a_truncated_classification_is_split_and_retried() {
+    let fx = fixture().await;
+    let alpha = project(&fx, "alpha").await;
+    let body = (0..6)
+        .map(|i| format!("Always run check number {i} before pushing."))
+        .collect::<Vec<_>>()
+        .join(" ");
+    prompt(&fx, alpha, &body, 1).await;
+    let llm = FakeProfileLlm {
+        truncate_from: Some(3),
+        merge_statement: "Run the checks before pushing.".into(),
+        ..FakeProfileLlm::default()
+    };
+    let sizes = llm.classify_sizes.clone();
+    let budgets = llm.budgets.clone();
+    let report = pass_with(&fx, &single_user(), Arc::new(llm)).await;
+    assert_eq!(report.llm_fallbacks, 0, "{report:?}");
+    // Of the classification calls, only the four that answered count (1 + 2
+    // + 1 + 2 sentences); `llm_calls` also counts the merges.
+    let merges = budgets
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(operation, _)| operation == "merge")
+        .count();
+    assert_eq!(report.llm_calls, 4 + merges, "{report:?}");
+    let sizes = sizes.lock().unwrap();
+    // 6 truncates, then 3 and 3, which split into 1 + 2 each.
+    assert_eq!(*sizes, vec![6, 3, 1, 2, 3, 1, 2], "{sizes:?}");
+}
+
+/// The pass's call cap still holds while splitting: halves it can no longer
+/// pay for fall back to the zero-LLM detector, counted once as a fallback.
+#[tokio::test]
+async fn splitting_stops_at_the_classification_call_cap() {
+    let fx = fixture().await;
+    let alpha = project(&fx, "alpha").await;
+    let body = (0..6)
+        .map(|i| format!("Always run check number {i} before pushing."))
+        .collect::<Vec<_>>()
+        .join(" ");
+    prompt(&fx, alpha, &body, 1).await;
+    let llm = FakeProfileLlm {
+        truncate_from: Some(2),
+        merge_statement: "Run the checks before pushing.".into(),
+        ..FakeProfileLlm::default()
+    };
+    let sizes = llm.classify_sizes.clone();
+    let report = pass_with(&fx, &single_user(), Arc::new(llm)).await;
+    // 6, 3, 1, 2, 1, 1, 3, 1: eight calls spend the cap before the last
+    // sentences of the second half get theirs.
+    assert_eq!(
+        *sizes.lock().unwrap(),
+        vec![6, 3, 1, 2, 1, 1, 3, 1],
+        "{report:?}"
+    );
+    assert_eq!(report.llm_fallbacks, 1, "{report:?}");
+}
+
+/// A single sentence whose classification still truncates cannot be split:
+/// it falls back to the zero-LLM detector.
+#[tokio::test]
+async fn a_single_truncated_sentence_falls_back_to_the_zero_llm_path() {
+    let fx = fixture().await;
+    let alpha = project(&fx, "alpha").await;
+    prompt(
+        &fx,
+        alpha,
+        "Always use pnpm for installs in every project.",
+        1,
+    )
+    .await;
+    let llm = FakeProfileLlm {
+        truncate_from: Some(1),
+        merge_statement: "Use pnpm for installs.".into(),
+        ..FakeProfileLlm::default()
+    };
+    let sizes = llm.classify_sizes.clone();
+    let report = pass_with(&fx, &single_user(), Arc::new(llm)).await;
+    assert_eq!(report.llm_fallbacks, 1, "{report:?}");
+    assert_eq!(*sizes.lock().unwrap(), vec![1]);
+    // The zero-LLM detector still turns the sentence into an entry.
+    assert_eq!(profile_pages(&fx, "_global").len(), 1, "{report:?}");
 }
 
 /// The core scenario on the LLM path: a habit said loosely in one project is

@@ -1238,6 +1238,7 @@ fn run_wrapper_with_fake_docker_env(
         .env("HOME", shell_path(tmp.path()))
         .env_remove("AI_MEMORY_SERVER_URL")
         .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("AI_MEMORY_LLM_COMPAT_STREAM")
         // Guarantees the "unset" case in
         // `posix_wrapper_forwards_embedding_prefixes_by_presence_not_non_emptiness`
         // is actually unset rather than silently inheriting whatever the
@@ -1287,6 +1288,43 @@ fn powershell_wrapper_lists_subscription_oauth_tokens_in_its_env_allowlist() {
                 .lines()
                 .any(|line| line.trim() == format!("\"{name}\",")),
             "PowerShell wrapper must list {name} in the helper env allowlist"
+        );
+    }
+}
+
+#[test]
+fn powershell_wrapper_forwards_compat_stream_setting() {
+    let wrapper = read_repo("bin/ai-memory.ps1");
+    let allowlist = wrapper
+        .split_once("foreach ($Name in @(")
+        .and_then(|(_, rest)| rest.split_once(")) {"))
+        .map(|(allowlist, _)| allowlist)
+        .expect("PowerShell wrapper env allowlist");
+    assert!(
+        allowlist
+            .lines()
+            .any(|line| line.trim() == "\"AI_MEMORY_LLM_COMPAT_STREAM\","),
+        "PowerShell wrapper must forward AI_MEMORY_LLM_COMPAT_STREAM"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn posix_wrapper_forwards_compat_stream_setting() {
+    const STREAM: &str = "AI_MEMORY_LLM_COMPAT_STREAM";
+    for stream in [None, Some("false")] {
+        let forwarded: Vec<(&str, &str)> =
+            stream.map(|value| (STREAM, value)).into_iter().collect();
+        let args = run_wrapper_with_fake_docker_and_forwarded_env(
+            &["llm-test"],
+            "[name=seccomp]",
+            &forwarded,
+        );
+        let args: Vec<&str> = args.lines().collect();
+        assert_eq!(
+            args.windows(2).any(|pair| pair == ["-e", STREAM]),
+            stream.is_some(),
+            "wrapper must forward the configured stream setting by name"
         );
     }
 }
@@ -2728,16 +2766,30 @@ mod slow {
             .env("FAKE_WRAPPER_PAYLOAD", &payload)
             .output()
             .unwrap();
-        assert!(
-            output.status.success(),
-            "upgrade failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("wrapper checksum mismatch; refusing update"));
-        assert!(!String::from_utf8_lossy(&output.stderr).contains("hostile payload executed"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // The wrapper self-update refuses the mismatched download, keeps the
+        // original script, and never runs the hostile payload.
+        assert!(
+            stdout.contains("wrapper checksum mismatch; refusing update"),
+            "stdout={stdout} stderr={stderr}"
+        );
+        assert!(
+            !stderr.contains("hostile payload executed"),
+            "stderr={stderr}"
+        );
         assert_eq!(std::fs::read_to_string(&wrapper).unwrap(), original);
+        // The native host-launch client, whose checksum the same fake curl also
+        // fails, then fails closed instead of installing an unverified binary,
+        // so the upgrade stops with a non-zero status (GHSA-f43g).
+        assert!(
+            !output.status.success(),
+            "upgrade must fail closed on the native-client mismatch: stdout={stdout} stderr={stderr}"
+        );
+        assert!(
+            stderr.contains("native host-launch client checksum mismatch"),
+            "stderr={stderr}"
+        );
     }
 
     #[cfg(unix)]

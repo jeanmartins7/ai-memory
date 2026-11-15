@@ -27,6 +27,74 @@ function setup(): { server: FakeServer; memory: AiMemoryClient } {
 }
 
 describe("pages", () => {
+  it("preflights an existing target by name or stable id", async () => {
+    const { server, memory } = setup();
+    server.tools.set("memory_resolve_write_target", () => payloads.resolvedWriteTarget);
+    const resolved = await memory.pages.resolveWriteTarget({
+      target: { workspace: "demo", project: "app" },
+    });
+    assert.deepEqual(server.lastArgs(), { workspace: "demo", project: "app" });
+    assert.equal(resolved.projectId, payloads.resolvedWriteTarget.project_id);
+    await memory.pages.resolveWriteTarget({
+      target: { workspace: "demo", projectId: payloads.resolvedWriteTarget.project_id },
+    });
+    assert.deepEqual(server.lastArgs(), {
+      workspace: "demo",
+      project_id: payloads.resolvedWriteTarget.project_id,
+    });
+    const before = server.requests.length;
+    await assert.rejects(
+      memory.pages.resolveWriteTarget({
+        target: { workspace: "demo", project: "app", projectId: "also" },
+      } as never),
+      ArgumentError,
+    );
+    assert.equal(server.requests.length, before);
+  });
+
+  it("writes conditional pages as one exact atomic batch", async () => {
+    const { server, memory } = setup();
+    server.tools.set("memory_write_pages_batch", () => payloads.batchWrite);
+    const result = await memory.pages.writeBatch({
+      target: { workspace: "demo", projectId: payloads.resolvedWriteTarget.project_id },
+      pages: [
+        {
+          path: "notes/a.md",
+          body: "# A",
+          createOnly: true,
+          tags: ["import"],
+          sourceFiles: [{ path: "src/a.rs", commit: "3f2a9c1" }],
+        },
+        { path: "notes/b.md", body: "# B", expectedPageId: payloads.PAGE_ID },
+      ],
+    });
+    assert.deepEqual(server.lastArgs(), {
+      workspace: "demo",
+      project_id: payloads.resolvedWriteTarget.project_id,
+      pages: [
+        {
+          path: "notes/a.md",
+          body: "# A",
+          create_only: true,
+          tags: ["import"],
+          source_files: [{ path: "src/a.rs", commit: "3f2a9c1" }],
+        },
+        { path: "notes/b.md", body: "# B", expected_page_id: payloads.PAGE_ID },
+      ],
+    });
+    assert.equal(result.pages[1]?.pageId, payloads.NEXT_PAGE_ID);
+    assert.equal(result.checkpoint, "c04d2f91");
+    const before = server.requests.length;
+    await assert.rejects(
+      memory.pages.writeBatch({
+        target: { workspace: "demo", project: "app" },
+        pages: [{ path: "notes/a.md", body: "# A" }],
+      } as never),
+      ArgumentError,
+    );
+    assert.equal(server.requests.length, before);
+  });
+
   it("write sends wire names, omits unset options and decodes the result", async () => {
     const { server, memory } = setup();
     server.tools.set("memory_write_page", () => payloads.write);
@@ -35,6 +103,7 @@ describe("pages", () => {
       body: "# Retry policy",
       tags: ["a"],
       expiresAt: "2099-01-01",
+      sourceFiles: [{ path: "bin/deploy.sh", commit: "3f2a9c1" }],
       expectedPageId: payloads.PAGE_ID,
     });
     assert.deepEqual(server.lastArgs(), {
@@ -44,6 +113,7 @@ describe("pages", () => {
       body: "# Retry policy",
       tags: ["a"],
       expires_at: "2099-01-01",
+      source_files: [{ path: "bin/deploy.sh", commit: "3f2a9c1" }],
       expected_page_id: payloads.PAGE_ID,
     });
     assert.equal(result.pageId, payloads.NEXT_PAGE_ID);
@@ -183,6 +253,33 @@ describe("pages", () => {
     assert.equal(server.requests.length, before);
   });
 
+  it("reads a page from a server that predates section metadata", async () => {
+    const { server, memory } = setup();
+    const { path, page_id, title, body } = payloads.read;
+    server.tools.set("memory_read_page", () => ({ path, page_id, title, body, frontmatter: {} }));
+    const page = await memory.pages.read({ path });
+    assert.equal(page.pageId, page_id);
+    assert.equal(page.body, body);
+    assert.deepEqual(page.sections, []);
+    assert.equal(page.sectionsTruncated, false);
+  });
+
+  it("rejects incomplete or invalid section metadata", async () => {
+    const { server, memory } = setup();
+    const { path, page_id, title, body } = payloads.read;
+    for (const metadata of [
+      { sections: payloads.read.sections },
+      { sections_truncated: false },
+      { sections: null, sections_truncated: false },
+      { sections: payloads.read.sections, sections_truncated: "false" },
+    ]) {
+      server.tools.set("memory_read_page", () => ({
+        path, page_id, title, body, frontmatter: {}, ...metadata,
+      }));
+      await assert.rejects(memory.pages.read({ path }), ProtocolError);
+    }
+  });
+
   it("delete decodes the checkpoints", async () => {
     const { server, memory } = setup();
     server.tools.set("memory_delete_page", () => payloads.del);
@@ -200,6 +297,9 @@ describe("pages", () => {
 
   it("update carries metadata over, applies the change and guards on the read version", async () => {
     const { server, memory } = setup();
+    const readSchema = server.schemas["memory_read_page"];
+    assert.ok(readSchema !== undefined);
+    delete readSchema.properties["max_chars"];
     server.tools.set("memory_read_page", () => payloads.read);
     server.tools.set("memory_write_page", () => payloads.write);
     await memory.pages.update("notes/retries.md", (current) => ({
@@ -220,9 +320,97 @@ describe("pages", () => {
       entities: ["foo bar"],
       relations: { fixes: ["notes/a.md"] },
       expires_at: "2099-01-01",
+      source_files: [{ path: "bin/deploy.sh", commit: "3f2a9c1" }],
       expected_page_id: payloads.PAGE_ID,
     });
   });
+
+  it("update carries a scalar profile stack tag and clears explicit enforcement", async () => {
+    const { server, memory } = setup();
+    server.tools.set("memory_read_page", () => ({
+      ...payloads.read,
+      path: "profile/style/types.md",
+      frontmatter: { applies_to: "typescript", enforced_by: "eslint rule" },
+    }));
+    server.tools.set("memory_write_page", () => payloads.write);
+    await memory.pages.update("profile/style/types.md", () => ({ enforcedBy: null }), {
+      scope: { workspace: "default", project: "_global" },
+    });
+    assert.deepEqual(server.lastArgs(), {
+      workspace: "default",
+      project: "_global",
+      path: "profile/style/types.md",
+      body: payloads.read.body,
+      applies_to: ["typescript"],
+      expected_page_id: payloads.PAGE_ID,
+    });
+  });
+
+  it("update rereads a truncated page and guards on the complete version", async () => {
+    const { server, memory } = setup();
+    const complete = "x".repeat(12_344) + "!";
+    server.tools.set("memory_read_page", (args) =>
+      args["max_chars"] === undefined
+        ? {
+            ...payloads.read,
+            body: complete.slice(0, 12_000) + "\n[body truncated]",
+            truncated: true,
+            total_chars: complete.length,
+          }
+        : {
+            ...payloads.read,
+            page_id: payloads.NEXT_PAGE_ID,
+            body: complete,
+            truncated: false,
+            total_chars: complete.length,
+          },
+    );
+    server.tools.set("memory_write_page", () => payloads.write);
+
+    let callbacks = 0;
+    await memory.pages.update("notes/retries.md", (current) => {
+      callbacks += 1;
+      assert.equal(current.body, complete);
+      assert.equal(current.pageId, payloads.NEXT_PAGE_ID);
+      return { tags: ["retagged"] };
+    });
+    assert.equal(callbacks, 1);
+    const calls = server.toolCalls();
+    assert.deepEqual(calls.map((call) => call.name), [
+      "memory_read_page", "memory_read_page", "memory_write_page",
+    ]);
+    assert.equal(calls[0]?.args["max_chars"], undefined);
+    assert.equal(calls[1]?.args["max_chars"], 64_000);
+    assert.equal(calls[2]?.args["body"], complete);
+    assert.equal(calls[2]?.args["expected_page_id"], payloads.NEXT_PAGE_ID);
+  });
+
+  for (const [initialSize, expectedReads] of [[64_001, 1], [12_345, 2]] as const) {
+    it(`update refuses an incomplete page after ${expectedReads} read(s)`, async () => {
+      const { server, memory } = setup();
+      server.tools.set("memory_read_page", (args) => ({
+        ...payloads.read,
+        body: "partial body",
+        truncated: true,
+        total_chars: args["max_chars"] === undefined ? initialSize : 64_001,
+      }));
+      server.tools.set("memory_write_page", () => payloads.write);
+      let callbacks = 0;
+      await assert.rejects(
+        memory.pages.update("notes/retries.md", () => {
+          callbacks += 1;
+          return { tags: ["retagged"] };
+        }),
+        (error: unknown) =>
+          error instanceof ProtocolError && error.message.includes("complete page body"),
+      );
+      assert.equal(callbacks, 0);
+      assert.deepEqual(
+        server.toolCalls().map((call) => call.name),
+        Array.from({ length: expectedReads }, () => "memory_read_page"),
+      );
+    });
+  }
 
   it("update writes nothing when the change function throws", async () => {
     const { server, memory } = setup();
@@ -407,6 +595,8 @@ describe("messages", () => {
     server.tools.set("memory_message_send", () => ({ message_id: payloads.MESSAGE_ID }));
     const sent = await memory.messages.send({
       to: OTHER,
+      toAgent: "codex",
+      fromAgent: "claude-code",
       body: "please do X",
       subject: "hi",
       nature: "measured",
@@ -415,8 +605,10 @@ describe("messages", () => {
     assert.deepEqual(server.lastArgs(), {
       to_workspace: "demo",
       to_project: "other",
+      to_agent: "codex",
       from_workspace: "demo",
       from_project: "app",
+      from_agent: "claude-code",
       body: "please do X",
       subject: "hi",
       nature: "measured",
@@ -474,11 +666,16 @@ describe("reads", () => {
     const recent = await memory.recent({ limit: 3 });
     assert.deepEqual(server.lastArgs(), { workspace: "demo", project: "app", limit: 3 });
     assert.equal(recent.hits[0]?.path, "notes/retries.md");
-    const briefing = await memory.briefing({ recentPagesLimit: 2, settledFirst: true });
+    const briefing = await memory.briefing({
+      recentPagesLimit: 2,
+      recentSessionsLimit: 3,
+      settledFirst: true,
+    });
     assert.deepEqual(server.lastArgs(), {
       workspace: "demo",
       project: "app",
       recent_pages_limit: 2,
+      recent_sessions_limit: 3,
       settled_first: true,
     });
     assert.equal(briefing.activity7d.pagesUpdated, 1);
@@ -673,6 +870,18 @@ describe("wire names", () => {
     // Call every wrapper with every option set; decoding failures are
     // expected because the fake answers `{}`.
     const calls: Promise<unknown>[] = [
+      memory.pages.resolveWriteTarget({ target: { workspace: "demo", project: "app" } }),
+      memory.pages.resolveWriteTarget({
+        target: { workspace: "demo", projectId: payloads.resolvedWriteTarget.project_id },
+      }),
+      memory.pages.writeBatch({
+        target: { workspace: "demo", project: "app" },
+        pages: [{ path: "p", body: "b", createOnly: true }],
+      }),
+      memory.pages.writeBatch({
+        target: { workspace: "demo", projectId: payloads.resolvedWriteTarget.project_id },
+        pages: [{ path: "p", body: "b", expectedPageId: "v" }],
+      }),
       memory.pages.write({
         path: "p",
         body: "b",
@@ -685,6 +894,9 @@ describe("wire names", () => {
         abstract: "a",
         relations: { fixes: ["x"] },
         expiresAt: "2099-01-01",
+        appliesTo: ["typescript"],
+        enforcedBy: "eslint rule",
+        sourceFiles: [{ path: "p", commit: "3f2a9c1" }],
         expectedPageId: "v",
       }),
       memory.pages.write({ path: "p", body: "b", createOnly: true }),
@@ -721,7 +933,7 @@ describe("wire names", () => {
       memory.query({ query: "q", global: true }),
       memory.status(),
       memory.recent({ limit: 1 }),
-      memory.briefing({ recentPagesLimit: 1, settledFirst: true }),
+      memory.briefing({ recentPagesLimit: 1, recentSessionsLimit: 1, settledFirst: true }),
       memory.explore({ focus: "f", recentPagesLimit: 1, reasoning: "low" }),
       memory.observations({
         sessionId: "s",
@@ -745,7 +957,9 @@ describe("wire names", () => {
       memory.handoffs.cancel({ handoffId: "h", anyOwner: true }),
       memory.messages.send({
         to: OTHER,
+        toAgent: "codex",
         from: SCOPE,
+        fromAgent: "claude-code",
         body: "b",
         subject: "s",
         nature: "measured",

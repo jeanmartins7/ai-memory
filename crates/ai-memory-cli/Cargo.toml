@@ -28,6 +28,7 @@ default = []
 management-ui = ["ai-memory-mcp/management-ui", "ai-memory-web/management-ui"]
 
 [dependencies]
+askama.workspace = true
 ai-memory-consolidate.workspace = true
 ai-memory-core.workspace = true
 ai-memory-hooks.workspace = true
@@ -37,11 +38,13 @@ ai-memory-store.workspace = true
 ai-memory-web.workspace = true
 ai-memory-workstream.workspace = true
 ai-memory-wiki.workspace = true
+regex.workspace = true
 reqwest.workspace = true
 secrecy.workspace = true
 sha2.workspace = true
 base64.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
 axum.workspace = true
 # Sets SO_KEEPALIVE on accepted `serve` sockets (#792); not a workspace dep,
 # `ai-memory-cli` is the only crate that needs it.
@@ -119,3 +122,7 @@ workspace = true
 
 [target."cfg(windows)".dependencies]
 windows-registry = "0.100.0"
+# Stable, safe process creation with an explicit inherited-handle list. std's
+# corresponding Windows APIs are still unstable at our minimum Rust version.
+# Pinned exact: a new 0.1.x is vetted before it ships in a release.
+win-custody = "=0.1.2"

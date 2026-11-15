@@ -23,7 +23,10 @@ Warp, Kilo Code, Goose and OpenHuman have no
 > other client gets a local stdio entry, in its own format, that runs
 > `ai-memory mcp-bridge --no-session-id --server-url <url>`: the bridge reads
 > the token file at launch and forwards no session id, so the client passes
-> `workspace` and `project` like any static client. Stdio entries name the
+> `workspace` and `project` like any static client. When a call names no
+> scope, the bridge fills in the project of the directory the client launched
+> it from, resolved the way the CLI resolves one (see
+> [`auto-scope.md`](auto-scope.md#the-session-less-bridges-launch-scope)). Stdio entries name the
 > `ai-memory` binary by its absolute path, so the client does not need it on
 > its `PATH`; the Docker wrapper keeps the bare `ai-memory`. When the install
 > was given a data dir (`--data-dir`, `AI_MEMORY_DATA_DIR` or `data_dir` in
@@ -45,6 +48,23 @@ Warp, Kilo Code, Goose and OpenHuman have no
 > config already resolves a bearer, a different key is stored, the hooks
 > sign in with OIDC, or the snippet is only printed.
 
+> **A bridge started while the server restarts waits for it.** A stdio
+> client does not relaunch an MCP server that exited, so `mcp-bridge` waits
+> up to 3 seconds for a server whose port refuses connections (a service
+> restarting after an upgrade or a reboot) before it gives up. When nothing
+> answers, it exits with `could not reach the ai-memory server at <url>` and
+> says to check that the server is running and that the entry points at it.
+> Other connection failures, such as a host name that does not resolve, are
+> reported at once.
+
+> **Inbox push is explicit.** A session-aware Claude Code bridge can add
+> `--channel inbox` to advertise Claude's experimental `claude/channel`
+> capability and push a count-only pending-mail notice when it changes.
+> Claude loads it only when started with
+> `claude --dangerously-load-development-channels server:<entry name>`, since
+> the ai-memory bridge is not on Claude's channel allowlist. See
+> [`agent-messaging.md`](agent-messaging.md#mid-session-notices-for-claude-code).
+
 > **Transport is stateless by default.** Since v0.1.2 the HTTP transport
 > answers each request independently (plain JSON, no `Mcp-Session-Id`
 > required), so any client that points a remote URL at `/mcp`, including
@@ -54,7 +74,10 @@ Warp, Kilo Code, Goose and OpenHuman have no
 > supports stdio servers; session state has nothing to do with it. If you run a
 > client that *requires* MCP session continuity or server-initiated SSE
 > streams, start the server with `ai-memory serve --transport http
-> --http-stateful` to restore rmcp's session mode.
+> --http-stateful` to restore the legacy initialize-era session mode. Clients
+> that speak MCP 2026-07-28 use `server/discover` and per-request version
+> metadata, both served without a session; clients that send the older
+> `initialize` handshake keep working.
 
 This page documents how to register ai-memory as an MCP server with
 agent CLIs beyond the README quick start. For OpenCode, the generic
@@ -127,8 +150,9 @@ ai-memory's canonical events when possible:
 ### Hermes Agent
 
 ai-memory ships a first-party Hermes integration: lifecycle hooks and an MCP
-entry, both printed for you to merge into `~/.hermes/config.yaml`
-(`$HERMES_HOME/config.yaml`), which ai-memory never writes.
+entry, both printed for you to merge into the Hermes home's `config.yaml`
+(`$HERMES_HOME`, else `%LOCALAPPDATA%\hermes` on Windows and `~/.hermes`
+elsewhere), which ai-memory never writes.
 
 ```bash
 ai-memory install-hooks --agent hermes --server-url "http://homelab:49374"
@@ -156,8 +180,8 @@ install's own, which matters because Hermes passes MCP servers a filtered
 environment without `AI_MEMORY_AUTH_TOKEN`. Hermes is a static client, so the
 model passes `workspace` and `project` on project-scoped calls. `--apply` is
 refused. Hermes does not read MCP server instructions, so the routing rules
-reach the model only through the skills in `~/.hermes/skills` and the handoff
-in the next primary-session turn.
+reach the model only through the skills in the Hermes home's `skills/` and the
+handoff in the next primary-session turn.
 
 The community-maintained
 [`ai-memory-hermes-plugin`](https://github.com/MrLuciano/ai-memory-hermes-plugin)
@@ -344,7 +368,20 @@ there. The Codex plugin likewise registers `ai-memory mcp-bridge
 - Cursor hooks live in `~/.cursor/hooks.json` or `.cursor/hooks.json`.
   ai-memory maps `sessionStart`, `sessionEnd`, `beforeSubmitPrompt`,
   `preToolUse`, `postToolUse`, `postToolUseFailure`, `preCompact`, and
-  `stop` to the shared capture path.
+  `stop` to the shared capture path. Cursor fires `postToolUseFailure`
+  instead of `postToolUse` when a tool fails, times out or is denied. A
+  failed or timed-out call is stored as `outcome: error` with Cursor's
+  `error_message`, so the session page counts it and the handoff names it;
+  a denied call keeps its message but stays `outcome: unknown`.
+- When the default data dir's path needs quoting, `install-hooks --agent
+  cursor` leaves `--data-dir` out of each hook command and the hook finds that
+  directory itself. This covers the macOS default
+  (`~/Library/Application Support/ai-memory`) and a Windows user folder with a
+  space. A space-free default, such as the usual Linux path, and any custom
+  data dir are still passed, so a Cursor launched with a different
+  `XDG_DATA_HOME` writes to the same place. `ai-memory upgrade` rewrites
+  entries an older install wrote; so does running
+  `ai-memory install-hooks --agent cursor --apply` again (#1949).
 - Cursor watches `hooks.json` on save. For MCP config changes, restart
   Cursor or toggle the server off+on in **Settings → MCP**.
 - Sources: <https://cursor.com/docs/mcp>, <https://cursor.com/docs/hooks.md>
@@ -911,8 +948,15 @@ ai-memory install-hooks --agent gemini-cli --apply
 Gemini CLI's lifecycle event names differ from Claude Code's, so use
 `install-hooks --agent gemini-cli` rather than copying another agent's
 settings. ai-memory maps Gemini's `SessionStart`, `SessionEnd`,
-`BeforeTool`, `AfterTool`, and `PreCompress` events to the shared hook
-capture path; `SessionStart` also fetches pending handoffs.
+`BeforeAgent`, `AfterAgent`, `BeforeTool`, `AfterTool`, and `PreCompress`
+events to the shared hook capture path; `SessionStart` also fetches pending
+handoffs. `BeforeAgent` stores each user prompt and `AfterAgent` marks the
+end of each turn. Gemini hands both the prompt with the contents of every
+`@`-referenced file appended; ai-memory keeps only your words, and never
+stores the model's reply that `AfterAgent` carries. The script hooks of the
+Docker wrapper cannot cut the file contents out, so they skip a prompt that
+carries them. Re-run `install-hooks --agent gemini-cli --apply` to add the
+two events to an existing install.
 
 **Gotchas:**
 - Gemini supports stdio too via `command`/`args`, plus SSE via `url`.
@@ -1144,13 +1188,15 @@ The rendered hooks config looks like:
   nothing new is a harmless no-op). See
   [`docs/install.md`](install.md#antigravity-lifecycle-hooks) for the
   transcript read's limits.
-- `memory_handoff_begin` always creates an explicit manual handoff with no
-  `from_session_id` and `from_agent = other`; it is project-wide for cwd
-  matching but belongs to the creating operator by default. Pass `shared=true`
-  only to publish it to every operator in the project. That session-neutral
-  shape is the same for every MCP client. Handoffs carrying a
-  Codex or Claude session id came from canonical SessionEnd processing, not
-  from the manual tool. Use the explicit Antigravity finalizer when the
+- `memory_handoff_begin` always creates an explicit manual handoff; it is
+  project-wide for cwd matching but belongs to the creating operator by
+  default. Pass `shared=true` only to publish it to every operator in the
+  project. A client that forwards its hook session id (the session-aware
+  bridge, OpenCode 2) gets that session's id, harness and cwd recorded on the
+  handoff, but only when the server recorded that session in the handoff's
+  project for the same operator. Antigravity's static HTTP connection forwards
+  no session, so its manual handoff has no `from_session_id` and
+  `from_agent = other`. Use the explicit Antigravity finalizer when the
   session itself must end and produce an attributed automatic handoff.
 - The built-in `/web` route displays compiled wiki pages, not raw session or
   observation rows. To verify hook capture, compare the `sessions` and
@@ -1420,9 +1466,11 @@ fill both in:
   `SessionStart`, stores it in a single per-host slot
   (`<data-dir>/hook-state/devin-session-id`), reuses it for every later
   event, and clears it at `SessionEnd`. Set `AI_MEMORY_SESSION_ID` in the
-  hook environment to pin an externally managed run id instead. Because the
-  slot is per host+agent, two Devin sessions running *concurrently* on the
-  same machine share it: the newest `SessionStart` wins and earlier
+  hook environment to pin an externally managed run id instead. The native,
+  POSIX shell, and PowerShell hooks use that pin without changing the fallback
+  slot, and a pinned `SessionEnd` leaves the slot intact. Because the slot is per host+agent,
+  two unpinned Devin sessions running *concurrently* on the same machine
+  share it: the newest `SessionStart` wins and earlier
   sessions' remaining events are attributed to it (same graceful-degradation
   stance as the single-slot `/handoff` fallback). A payload that does carry
   its own `session_id` always wins over both.

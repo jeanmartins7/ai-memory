@@ -45,6 +45,7 @@ import type {
   BeginHandoffResult,
   Briefing,
   BriefingArgs,
+  BatchWritePage,
   CancelHandoffArgs,
   CancelHandoffResult,
   CancelMessageArgs,
@@ -74,6 +75,8 @@ import type {
   QueryResult,
   Raw,
   ReadPageArgs,
+  ResolveWriteTargetArgs,
+  ResolvedWriteTarget,
   RecentArgs,
   RecentResult,
   RelationName,
@@ -85,6 +88,8 @@ import type {
   UpdatePageOptions,
   WritePageArgs,
   WritePageResult,
+  WritePagesBatchArgs,
+  WritePagesBatchResult,
 } from "./types.js";
 
 /** Options of {@link AiMemoryClient}. */
@@ -110,9 +115,28 @@ export interface CallToolOptions extends CallOptions {
 
 const TIERS: readonly string[] = ["working", "episodic", "semantic", "procedural"];
 const RELATIONS: readonly RelationName[] = ["causes", "fixes", "contradicts"];
+// The maximum memory_read_page accepts for max_chars.
+const MAX_PAGE_UPDATE_READ_CHARS = 64_000;
 
 function scopeWire(scope: Scope): { workspace: string; project: string } {
   return { workspace: scope.workspace, project: scope.project };
+}
+
+function existingTargetWire(
+  target: unknown,
+  where: string,
+): { workspace: string; project?: string; project_id?: string } {
+  const value = argsObject(target as object, `${where}.target`) as Record<string, unknown>;
+  const workspace = requireText(value["workspace"], "target.workspace", where);
+  const project = value["project"];
+  const projectId = value["projectId"];
+  if ((project === undefined) === (projectId === undefined)) {
+    throw new ArgumentError(`${where}: target needs exactly one of project or projectId`);
+  }
+  if (project !== undefined) {
+    return { workspace, project: requireText(project, "target.project", where) };
+  }
+  return { workspace, project_id: requireText(projectId, "target.projectId", where) };
 }
 
 /** The metadata a page's frontmatter carries, in write-argument form. */
@@ -143,6 +167,12 @@ function metadataFromFrontmatter(frontmatter: Raw): PageMetadata {
   if (abstractText !== undefined) meta.abstract = abstractText;
   const expiresAt = text("expires_at");
   if (expiresAt !== undefined) meta.expiresAt = expiresAt;
+  const appliesTo = texts("applies_to");
+  const singleStack = text("applies_to");
+  if (appliesTo !== undefined) meta.appliesTo = appliesTo;
+  else if (singleStack !== undefined) meta.appliesTo = [singleStack];
+  const enforcedBy = text("enforced_by");
+  if (enforcedBy !== undefined) meta.enforcedBy = enforcedBy;
   const relations = frontmatter["relations"];
   if (relations !== null && typeof relations === "object" && !Array.isArray(relations)) {
     const kept: Partial<Record<RelationName, string[]>> = {};
@@ -153,6 +183,22 @@ function metadataFromFrontmatter(frontmatter: Raw): PageMetadata {
       }
     }
     if (Object.keys(kept).length > 0) meta.relations = kept;
+  }
+  const sourceFiles = frontmatter["source_files"];
+  if (
+    Array.isArray(sourceFiles) &&
+    sourceFiles.every(
+      (item) =>
+        item !== null &&
+        typeof item === "object" &&
+        typeof (item as Raw)["path"] === "string" &&
+        typeof (item as Raw)["commit"] === "string",
+    )
+  ) {
+    meta.sourceFiles = (sourceFiles as Raw[]).map((item) => ({
+      path: item["path"] as string,
+      commit: item["commit"] as string,
+    }));
   }
   return meta;
 }
@@ -167,6 +213,99 @@ export class PagesNamespace {
   /** @internal */
   constructor(core: Core) {
     this.#core = core;
+  }
+
+  /**
+   * Verify write access to an exact existing destination and return its
+   * canonical name and stable id. The operation never creates or promotes a
+   * scope. Bulk importers should resolve every destination before writing.
+   */
+  async resolveWriteTarget(
+    args: ResolveWriteTargetArgs,
+    options?: CallOptions,
+  ): Promise<ResolvedWriteTarget> {
+    const where = "pages.resolveWriteTarget";
+    const a = argsObject(args, where);
+    const decoded = await this.#core.invoke(
+      "memory_resolve_write_target",
+      existingTargetWire(a.target, where),
+      false,
+      options,
+    );
+    const o = record(decoded, "memory_resolve_write_target");
+    return {
+      workspace: str(o, "workspace", "memory_resolve_write_target"),
+      project: str(o, "project", "memory_resolve_write_target"),
+      projectId: str(o, "project_id", "memory_resolve_write_target"),
+      raw: o,
+    };
+  }
+
+  /**
+   * Atomically write one to 100 complete page versions into one existing
+   * project. Every entry must use `createOnly` or `expectedPageId`; one
+   * mismatch leaves the entire batch unchanged.
+   */
+  async writeBatch(
+    args: WritePagesBatchArgs,
+    options?: CallOptions,
+  ): Promise<WritePagesBatchResult> {
+    const where = "pages.writeBatch";
+    const a = argsObject(args, where);
+    const target = existingTargetWire(a.target, where);
+    if (!Array.isArray(a.pages) || a.pages.length === 0 || a.pages.length > 100) {
+      throw new ArgumentError(`${where}: pages must contain 1-100 entries`);
+    }
+    const pages = a.pages.map((page: BatchWritePage, index: number) => {
+      const itemWhere = `${where}.pages[${index}]`;
+      const item = argsObject(page, itemWhere);
+      requireText(item.path, "path", itemWhere);
+      if (typeof item.body !== "string") {
+        throw new ArgumentError(`${itemWhere}: body must be a string`);
+      }
+      if ((item.expectedPageId === undefined) === (item.createOnly !== true)) {
+        throw new ArgumentError(`${itemWhere}: pass exactly one of expectedPageId or createOnly`);
+      }
+      if (item.expectedPageId !== undefined) {
+        requireText(item.expectedPageId, "expectedPageId", itemWhere);
+      }
+      return wire({
+        path: item.path,
+        body: item.body,
+        title: item.title,
+        tier: item.tier,
+        tags: item.tags,
+        pinned: item.pinned,
+        kind: item.kind,
+        entities: item.entities,
+        abstract: item.abstract,
+        relations: item.relations,
+        expires_at: item.expiresAt,
+        source_files: item.sourceFiles,
+        expected_page_id: item.expectedPageId,
+        create_only: item.createOnly === true ? true : undefined,
+      });
+    });
+    const decoded = await this.#core.invoke(
+      "memory_write_pages_batch",
+      { ...target, pages },
+      true,
+      options,
+    );
+    const o = record(decoded, "memory_write_pages_batch");
+    return {
+      pages: requiredList(o, "pages", "memory_write_pages_batch", (value, itemWhere) => {
+        const item = record(value, itemWhere);
+        return {
+          index: num(item, "index", itemWhere),
+          path: str(item, "path", itemWhere),
+          pageId: str(item, "page_id", itemWhere),
+          raw: item,
+        };
+      }),
+      checkpoint: nullableStr(o, "checkpoint", "memory_write_pages_batch"),
+      raw: o,
+    };
   }
 
   /**
@@ -206,6 +345,9 @@ export class PagesNamespace {
         abstract: a.abstract,
         relations: a.relations,
         expires_at: a.expiresAt,
+        applies_to: a.appliesTo,
+        enforced_by: a.enforcedBy,
+        source_files: a.sourceFiles,
         expected_page_id: a.expectedPageId,
         create_only: a.createOnly === true ? true : undefined,
       }),
@@ -317,14 +459,17 @@ export class PagesNamespace {
     );
     const o = record(decoded, "memory_read_page");
     const frontmatter = o["frontmatter"];
-    const sections = requiredList(o, "sections", "memory_read_page", (value, where) => {
-      const section = record(value, where);
-      return {
-        anchor: str(section, "anchor", where),
-        level: num(section, "level", where),
-        sha256: str(section, "sha256", where),
-      };
-    });
+    const hasSectionMetadata = Object.hasOwn(o, "sections") || Object.hasOwn(o, "sections_truncated");
+    const sections = hasSectionMetadata
+      ? requiredList(o, "sections", "memory_read_page", (value, where) => {
+          const section = record(value, where);
+          return {
+            anchor: str(section, "anchor", where),
+            level: num(section, "level", where),
+            sha256: str(section, "sha256", where),
+          };
+        })
+      : [];
     return {
       pageId: str(o, "page_id", "memory_read_page"),
       path: str(o, "path", "memory_read_page"),
@@ -337,7 +482,9 @@ export class PagesNamespace {
           ? (frontmatter as Raw)
           : {},
       sections,
-      sectionsTruncated: bool(o, "sections_truncated", "memory_read_page"),
+      sectionsTruncated: hasSectionMetadata
+        ? bool(o, "sections_truncated", "memory_read_page")
+        : false,
       related: Array.isArray(o["related"])
         ? list(o, "related", "memory_read_page", relatedPage)
         : undefined,
@@ -378,13 +525,17 @@ export class PagesNamespace {
   /**
    * Read a page, apply `change`, and write it back only if nobody changed it
    * in between (`expectedPageId`). The page's current metadata (title, tier,
-   * tags, pinned, kind, entities, abstract, relations, TTL) is carried over
+   * tags, pinned, kind, entities, abstract, relations, TTL, source files) is carried over
    * unless `change` sets it; `null` clears a field.
    *
    * One attempt, no retry: on a concurrent change it throws
    * {@link PreconditionFailedError} and writes nothing, so the caller can
    * re-run it. The page must exist; create new pages with
    * `write({ createOnly: true })`.
+   *
+   * If the first body is truncated and fits within 64,000 characters, read
+   * it once more with that cap. A body that still cannot be read in full
+   * causes {@link ProtocolError} before `change` is called.
    *
    * Calls `memory_read_page`, then `memory_write_page`.
    */
@@ -401,7 +552,17 @@ export class PagesNamespace {
     const callOptions: CallOptions = {};
     if (signal !== undefined) callOptions.signal = signal;
     if (timeoutMs !== undefined) callOptions.timeoutMs = timeoutMs;
-    const current = await this.read({ path, scope }, callOptions);
+    let current = await this.read({ path, scope }, callOptions);
+    if (current.truncated === true) {
+      if (current.totalChars !== undefined && current.totalChars <= MAX_PAGE_UPDATE_READ_CHARS) {
+        current = await this.read({ path, scope, maxChars: MAX_PAGE_UPDATE_READ_CHARS }, callOptions);
+      }
+      if (current.truncated !== false) {
+        throw new ProtocolError(
+          "pages.update requires a complete page body. memory_read_page can return at most 64,000 characters.",
+        );
+      }
+    }
     const delta = await change(current);
     if (delta === null || typeof delta !== "object" || Array.isArray(delta)) {
       throw new ArgumentError(`${where}: change must return an object`);
@@ -585,8 +746,10 @@ export class MessagesNamespace {
       wire({
         to_workspace: to.workspace,
         to_project: to.project,
+        to_agent: a.toAgent,
         from_workspace: from.workspace,
         from_project: from.project,
+        from_agent: a.fromAgent,
         body: a.body,
         subject: a.subject,
         nature: a.nature,
@@ -890,6 +1053,7 @@ export class AiMemoryClient {
       wire({
         ...scopeWire(scope),
         recent_pages_limit: a.recentPagesLimit,
+        recent_sessions_limit: a.recentSessionsLimit,
         settled_first: a.settledFirst === true ? true : undefined,
       }),
       false,
